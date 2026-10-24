@@ -1,0 +1,3185 @@
+"""Haunted Stockfish - a Stockfish move assistant for chess.com bot games.
+
+Setup:  python -m pip install -U selenium python-chess customtkinter keyboard edge-tts
+Needs:  stockfish.exe next to this script, and Google Chrome.
+"""
+
+import array
+import asyncio
+import html
+import json
+import math
+import os
+import queue
+import random
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tkinter as tk
+import wave
+
+import chess
+import chess.engine
+import customtkinter as ctk
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+
+try:
+    import keyboard  # python -m pip install keyboard
+except Exception:
+    keyboard = None
+
+try:
+    import winsound  # Windows only (used for the wind ambience)
+except Exception:
+    winsound = None
+
+try:
+    import edge_tts  # python -m pip install edge-tts  (neural voices, needs internet)
+except Exception:
+    edge_tts = None
+
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+DEBUG_PORT = 9222
+START_URL = "https://www.chess.com/play/computer"
+
+# The assistant only runs on chess.com bot ("computer") games. On any other
+# page it pauses and does nothing (unless Test mode is ticked).
+ALLOWED_URL_PART = "/computer"
+
+DEFAULT_HOTKEY = "delete"
+DEFAULT_REVEAL_KEY = "q"
+
+INSTANT_MODE = "Instant"
+DELAY_MODE = "Delayed"
+STEP_MODE = "Step by step"
+REVEAL_MODES = [INSTANT_MODE, DELAY_MODE, STEP_MODE]
+# Older saved settings used these names.
+OLD_MODE_NAMES = {
+    "Instantly": INSTANT_MODE,
+    "After 1 second": DELAY_MODE,
+    "After delay": DELAY_MODE,
+    "Step by step (key)": STEP_MODE,
+}
+
+CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "assistant_settings.json"
+)
+
+CHROME_PATHS = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+]
+
+# ---------------------------------------------------------------------------
+# Halloween palette
+# ---------------------------------------------------------------------------
+BG = "#0e0914"
+SURFACE = "#190f25"
+SURFACE2 = "#2a1a3d"
+PUMPKIN = "#ff7518"
+PUMPKIN_HOVER = "#e0620d"
+PURPLE = "#7b2fbe"
+PURPLE_DARK = "#4b1d78"
+SLIME = "#7dff4f"
+SLIME_DARK = "#3c9a1f"
+BLOOD = "#c62828"
+BLOOD_HOVER = "#a31f1f"
+CANDLE = "#ffd24a"
+TEXT = "#f3e9ff"
+MUTED = "#9d86b8"
+
+STATUS_COLORS = {
+    "idle": MUTED,
+    "run": SLIME,
+    "think": PUMPKIN,
+    "pause": CANDLE,
+    "error": "#ff5a5a",
+}
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"Could not save settings: {e}")
+
+
+def num_setting(cfg, key, default, lo, hi, cast=float):
+    """Read a number from the saved settings, clamped to a sane range."""
+    try:
+        value = cast(cfg.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(lo, min(hi, value))
+
+
+def port_is_open(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def find_chrome():
+    for p in CHROME_PATHS:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def find_computer_tab(driver, test_mode=False):
+    """True if the controlled tab is a page we're allowed to work on:
+    a chess.com bot game, or (in test mode) any chess.com page.
+    If the current tab isn't one, tries to switch to another tab that is."""
+
+    def page_ok(url):
+        if "chess.com" not in url:
+            return False
+        return True if test_mode else ALLOWED_URL_PART in url
+
+    try:
+        if page_ok(driver.current_url):
+            return True
+    except Exception:
+        pass
+    try:
+        for handle in driver.window_handles:
+            driver.switch_to.window(handle)
+            if page_ok(driver.current_url):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Page scripts
+# ---------------------------------------------------------------------------
+
+# Reads the pieces straight off the chess.com board. Each piece has classes
+# like "piece wn square-72" = white knight on file 7 (g), rank 2. Highlighted
+# squares show the last move played. "flipped" is true when Black is at the
+# bottom of the screen (i.e. you are playing Black).
+READ_BOARD_JS = r"""
+var root = document.querySelector('wc-chess-board, chess-board') || document;
+var pieces = [];
+root.querySelectorAll('.piece').forEach(function(p) {
+    var cls = Array.from(p.classList);
+    var pc = cls.find(function(c) { return /^[wb][pnbrqk]$/.test(c); });
+    var sq = cls.find(function(c) { return /^square-\d\d$/.test(c); });
+    if (pc && sq) { pieces.push(pc + ':' + sq.slice(7)); }
+});
+var highlights = [];
+root.querySelectorAll('.highlight').forEach(function(h) {
+    var sq = Array.from(h.classList).find(function(c) { return /^square-\d\d$/.test(c); });
+    if (sq) { highlights.push(sq.slice(7)); }
+});
+var flipped = null;
+var lo = null, hi = null;
+root.querySelectorAll('.piece').forEach(function(p) {
+    var sq = Array.from(p.classList).find(function(c) { return /^square-\d\d$/.test(c); });
+    if (!sq) { return; }
+    var rank = parseInt(sq.charAt(8), 10);
+    var top = p.getBoundingClientRect().top;
+    if (lo === null || rank < lo.rank) { lo = {rank: rank, top: top}; }
+    if (hi === null || rank > hi.rank) { hi = {rank: rank, top: top}; }
+});
+if (lo && hi && lo.rank !== hi.rank) { flipped = lo.top < hi.top; }
+else if (root.classList) { flipped = root.classList.contains('flipped'); }
+var ae = document.activeElement;
+var typing = false;
+if (ae) {
+    var tn = (ae.tagName || '').toLowerCase();
+    typing = tn === 'input' || tn === 'textarea' || tn === 'select' || ae.isContentEditable === true;
+}
+return {pieces: pieces, highlights: highlights, flipped: flipped, typing: typing};
+"""
+
+# Draws (or removes) the recommended moves on top of the board, in chess.com's
+# arrow colors (green = best, yellow = 2nd, red = 3rd).
+SET_OVERLAY_JS = r"""
+// arguments[0] = list of moves like ["g1f3", "e2e4"] (best first), or null to clear
+// arguments[1] = flipped (true when Black is at the bottom)
+// arguments[2] = "arrows" or "squares"
+// arguments[3] = opacity (0.2 - 1)
+// Safe to call repeatedly: it only redraws when something changed.
+var moves = arguments[0];
+var flipped = arguments[1] === true;
+var style = arguments[2] === 'squares' ? 'squares' : 'arrows';
+var opacity = Math.max(0.2, Math.min(1, Number(arguments[3]) || 0.8));
+var root = document.querySelector('wc-chess-board, chess-board');
+if (!root) { return false; }
+var old = root.querySelector('#sf-overlay');
+if (!moves || !moves.length) { if (old) { old.remove(); } return true; }
+var sig = moves.join(',') + '|' + flipped + '|' + style + '|' + opacity;
+if (old && old.getAttribute('data-sig') === sig) { return true; }
+if (old) { old.remove(); }
+if (window.getComputedStyle(root).position === 'static') {
+    root.style.position = 'relative';
+}
+
+var COLORS = ['#81b64c', '#ffaa00', '#eb6150'];
+var NS = 'http://www.w3.org/2000/svg';
+
+function center(sq) {
+    var f = sq.charCodeAt(0) - 97;
+    var r = parseInt(sq.charAt(1), 10) - 1;
+    var x = flipped ? (7 - f + 0.5) * 12.5 : (f + 0.5) * 12.5;
+    var y = flipped ? (r + 0.5) * 12.5 : (7 - r + 0.5) * 12.5;
+    return {x: x, y: y};
+}
+
+var svg = document.createElementNS(NS, 'svg');
+svg.setAttribute('id', 'sf-overlay');
+svg.setAttribute('data-sig', sig);
+svg.setAttribute('viewBox', '0 0 100 100');
+svg.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;' +
+                    'pointer-events:none;z-index:200;';
+
+function drawArrow(uci, color) {
+    var a = center(uci.substring(0, 2));
+    var b = center(uci.substring(2, 4));
+    var dx = b.x - a.x, dy = b.y - a.y;
+    var adx = Math.abs(dx), ady = Math.abs(dy);
+    var knight = (Math.abs(adx - 25) < 0.5 && Math.abs(ady - 12.5) < 0.5) ||
+                 (Math.abs(adx - 12.5) < 0.5 && Math.abs(ady - 25) < 0.5);
+    var pts = [a];
+    var last = a;
+    if (knight) {
+        // Knight moves are drawn as an L, like chess.com's knight arrows.
+        var corner = adx > ady ? {x: b.x, y: a.y} : {x: a.x, y: b.y};
+        pts.push(corner);
+        last = corner;
+    }
+    var sx = b.x - last.x, sy = b.y - last.y;
+    var len = Math.sqrt(sx * sx + sy * sy) || 1;
+    var ux = sx / len, uy = sy / len;
+    var px = -uy, py = ux;
+    var headLen = 4.6, headHalf = 3.0;
+    var tipX = b.x - ux * 1.0, tipY = b.y - uy * 1.0;
+    var baseX = tipX - ux * headLen, baseY = tipY - uy * headLen;
+    pts.push({x: baseX, y: baseY});
+
+    var g = document.createElementNS(NS, 'g');
+    g.setAttribute('opacity', String(opacity));
+
+    var shaft = document.createElementNS(NS, 'polyline');
+    var coords = [];
+    for (var i = 0; i < pts.length; i++) { coords.push(pts[i].x + ',' + pts[i].y); }
+    shaft.setAttribute('points', coords.join(' '));
+    shaft.setAttribute('fill', 'none');
+    shaft.setAttribute('stroke', color);
+    shaft.setAttribute('stroke-width', 2.4);
+    shaft.setAttribute('stroke-linejoin', 'miter');
+    shaft.setAttribute('stroke-linecap', 'butt');
+    g.appendChild(shaft);
+
+    var head = document.createElementNS(NS, 'polygon');
+    head.setAttribute('points',
+        tipX + ',' + tipY + ' ' +
+        (baseX + px * headHalf) + ',' + (baseY + py * headHalf) + ' ' +
+        (baseX - px * headHalf) + ',' + (baseY - py * headHalf));
+    head.setAttribute('fill', color);
+    g.appendChild(head);
+    svg.appendChild(g);
+}
+
+function drawSquares(uci, color) {
+    var squares = [uci.substring(0, 2), uci.substring(2, 4)];
+    for (var i = 0; i < squares.length; i++) {
+        var c = center(squares[i]);
+        var r = document.createElementNS(NS, 'rect');
+        r.setAttribute('x', c.x - 6.25);
+        r.setAttribute('y', c.y - 6.25);
+        r.setAttribute('width', 12.5);
+        r.setAttribute('height', 12.5);
+        r.setAttribute('fill', color);
+        r.setAttribute('opacity', String(opacity * 0.8));
+        svg.appendChild(r);
+    }
+}
+
+// Draw the worst first so the best move ends up on top.
+for (var k = Math.min(moves.length, 3) - 1; k >= 0; k--) {
+    if (style === 'squares') { drawSquares(moves[k], COLORS[k]); }
+    else { drawArrow(moves[k], COLORS[k]); }
+}
+root.appendChild(svg);
+return true;
+"""
+
+
+def board_from_dom(state):
+    """Build a python-chess Board from the page. Returns None if unclear."""
+    if not state or not state.get("pieces"):
+        raise ValueError("No pieces found on the page. Is a game board open?")
+
+    board = chess.Board(None)  # empty board
+    for item in state["pieces"]:
+        pc, sq = item.split(":")
+        square = chess.square(int(sq[0]) - 1, int(sq[1]) - 1)
+        color = chess.WHITE if pc[0] == "w" else chess.BLACK
+        board.set_piece_at(square, chess.Piece(chess.PIECE_SYMBOLS.index(pc[1]), color))
+
+    # Whose turn? The piece sitting on a highlighted square just moved.
+    mover_colors = set()
+    for h in state.get("highlights", []):
+        piece = board.piece_at(chess.square(int(h[0]) - 1, int(h[1]) - 1))
+        if piece:
+            mover_colors.add(piece.color)
+
+    if len(mover_colors) > 1:
+        return None  # a piece is selected mid-move; wait for a clear state
+    board.turn = chess.WHITE if not mover_colors else (not mover_colors.pop())
+
+    # Castling rights (best guess: king and rook on their home squares).
+    rights = chess.BB_EMPTY
+    for color, king_sq, rooks in (
+        (chess.WHITE, chess.E1, ((chess.H1, chess.BB_H1), (chess.A1, chess.BB_A1))),
+        (chess.BLACK, chess.E8, ((chess.H8, chess.BB_H8), (chess.A8, chess.BB_A8))),
+    ):
+        if board.piece_at(king_sq) == chess.Piece(chess.KING, color):
+            for rook_sq, bb in rooks:
+                if board.piece_at(rook_sq) == chess.Piece(chess.ROOK, color):
+                    rights |= bb
+    board.castling_rights = rights
+
+    if not board.is_valid():
+        return None  # likely mid-animation
+    return board
+
+
+# ---------------------------------------------------------------------------
+# Voice: personas, move narration, and a speech queue that never overlaps
+# ---------------------------------------------------------------------------
+
+PIECE_WORDS = {
+    chess.PAWN: "Pawn",
+    chess.KNIGHT: "Knight",
+    chess.BISHOP: "Bishop",
+    chess.ROOK: "Rook",
+    chess.QUEEN: "Queen",
+    chess.KING: "King",
+}
+
+# Each persona changes the voice (pitch / speed / gender where Windows has a
+# matching voice installed) and adds a little commentary.
+PERSONAS = {
+    "Plain": {},
+    "Cryptkeeper": {
+        "gender": "Male", "pitch": "x-low", "rate": "slow",
+        "open": ["Hehehe.", "Welcome, little ghoul.", "Oh, delicious."],
+        "alarm": "Ooh, that one hurt.",
+        "check": "The king trembles!",
+        "mate": "Sweet dreams!",
+        "capture": "Another soul for the crypt!",
+        "castle": "Hide behind the walls!",
+        "promo": "A new monster is born!",
+    },
+    "Dracula": {
+        "gender": "Male", "pitch": "low", "rate": "slow",
+        "open": ["Ah, my friend.", "Listen carefully.", "The night is young."],
+        "alarm": "Blood drains from my face.",
+        "check": "He is cornered!",
+        "mate": "Finished. Dark and final.",
+        "capture": "A taste of blood!",
+        "castle": "Retreat to the castle.",
+        "promo": "Rise, my child!",
+    },
+    "Witch": {
+        "gender": "Female", "pitch": "high", "rate": "medium",
+        "open": ["Oh, obviously.", "Try to keep up, dearie.", "Fine. Slowly, then."],
+        "alarm": "Well. That was a disaster.",
+        "check": "Check. Try not to cry.",
+        "mate": "Checkmate. Shocking, I know.",
+        "capture": "Snack time!",
+        "castle": "Hiding already?",
+        "promo": "Abracadabra!",
+    },
+}
+
+
+def spoken_square(square):
+    name = chess.square_name(square)
+    return f"{name[0].upper()} {name[1]}"
+
+
+def describe_move(board, move):
+    """Turn a move into natural speech: 'Knight to F 3', 'E pawn takes D 5',
+    'Castle kingside', ', check', ', checkmate'. Returns (text, flags)."""
+    flags = set()
+    piece = board.piece_at(move.from_square)
+    if piece is None:
+        return f"{spoken_square(move.from_square)} to {spoken_square(move.to_square)}", flags
+
+    if board.is_castling(move):
+        flags.add("castle")
+        kingside = chess.square_file(move.to_square) > chess.square_file(move.from_square)
+        text = "Castle kingside" if kingside else "Castle queenside"
+    else:
+        capture = board.is_capture(move)
+        if capture:
+            flags.add("capture")
+        dest = spoken_square(move.to_square)
+        if piece.piece_type == chess.PAWN:
+            file_letter = chess.square_name(move.from_square)[0].upper()
+            text = f"{file_letter} pawn takes {dest}" if capture else f"Pawn to {dest}"
+        else:
+            name = PIECE_WORDS[piece.piece_type]
+            # Two identical pieces can reach the square: say where this one starts.
+            clash = any(
+                m != move
+                and m.to_square == move.to_square
+                and board.piece_type_at(m.from_square) == piece.piece_type
+                for m in board.legal_moves
+            )
+            origin = f" from {spoken_square(move.from_square)}" if clash else ""
+            text = f"{name}{origin} takes {dest}" if capture else f"{name}{origin} to {dest}"
+        if move.promotion:
+            flags.add("promo")
+            text += f", promoting to {PIECE_WORDS[move.promotion].lower()}"
+
+    after = board.copy(stack=False)
+    after.push(move)
+    if after.is_checkmate():
+        flags.add("mate")
+        text += ", checkmate"
+    elif after.is_check():
+        flags.add("check")
+        text += ", check"
+    return text, flags
+
+
+def compose_speech(persona, text, flags, alarm=False):
+    """Wrap the move in the chosen persona's flavour."""
+    p = PERSONAS.get(persona) or {}
+    if not p:
+        return text
+    parts = [p["alarm"] if alarm else random.choice(p["open"]), text + "."]
+    for flag in ("mate", "check", "promo", "castle", "capture"):
+        if flag in flags:
+            parts.append(p[flag])
+            break
+    return " ".join(parts)
+
+
+def eval_to_fear(score, color):
+    """0.0 = you are comfortably winning, 1.0 = you are in deep trouble."""
+    try:
+        s = score.pov(color)
+        if s.is_mate():
+            return 0.0 if (s.mate() or 0) > 0 else 1.0
+        cp = s.score()
+        if cp is None:
+            return None
+        return max(0.0, min(1.0, (150 - cp) / 500.0))
+    except Exception:
+        return None
+
+
+# Neural voices (edge-tts). Pitch is in Hz and rate in % relative to the voice.
+EDGE_VOICES = {
+    "Plain": {"voice": "en-US-AriaNeural", "pitch": 0, "rate": 0},
+    "Cryptkeeper": {"voice": "en-GB-RyanNeural", "pitch": -22, "rate": -18},
+    "Dracula": {"voice": "en-US-GuyNeural", "pitch": -28, "rate": -14},
+    "Witch": {"voice": "en-US-JennyNeural", "pitch": 18, "rate": 0},
+}
+
+
+async def _edge_save(text, voice, rate, pitch, path):
+    comm = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+    await asyncio.wait_for(comm.save(path), timeout=10)
+
+
+def synth_edge_mp3(text, rate, persona, path):
+    """Render `text` to an mp3 with a Microsoft neural voice."""
+    cfg = EDGE_VOICES.get(persona) or EDGE_VOICES["Plain"]
+    pct = max(-60, min(60, cfg["rate"] + int(rate) * 6))
+    asyncio.run(_edge_save(text, cfg["voice"], f"{pct:+d}%", f"{cfg['pitch']:+d}Hz", path))
+
+
+def build_mp3_play_script(path, volume):
+    """PowerShell that plays an mp3 with Windows' built-in media player."""
+    p = path.replace("'", "''")
+    vol = max(0, min(100, int(volume))) / 100.0
+    return (
+        "Add-Type -AssemblyName presentationCore; "
+        "$p = New-Object System.Windows.Media.MediaPlayer; "
+        f"$p.Volume = {vol}; $p.Open([uri]'{p}'); $p.Play(); "
+        "$t = 0; "
+        "while (-not $p.NaturalDuration.HasTimeSpan -and $t -lt 100) "
+        "{ Start-Sleep -Milliseconds 50; $t++ }; "
+        "if ($p.NaturalDuration.HasTimeSpan) { Start-Sleep -Milliseconds "
+        "([int]$p.NaturalDuration.TimeSpan.TotalMilliseconds + 250) }; "
+        "$p.Close();"
+    )
+
+
+# --- engine telemetry --------------------------------------------------------
+
+def format_count(n):
+    n = float(n)
+    if n >= 1e9:
+        return f"{n / 1e9:.2f}G"
+    if n >= 1e6:
+        return f"{n / 1e6:.2f}M"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f}k"
+    return str(int(n))
+
+
+def telemetry_text(info):
+    """One line of engine stats from a python-chess info dict."""
+    if not info:
+        return "Engine: no data"
+    bits = []
+    if info.get("depth") is not None:
+        d = f"Depth {info['depth']}"
+        if info.get("seldepth"):
+            d += f"/{info['seldepth']}"
+        bits.append(d)
+    if info.get("nps") is not None:
+        bits.append(f"NPS {format_count(info['nps'])}")
+    if info.get("nodes") is not None:
+        bits.append(f"Nodes {format_count(info['nodes'])}")
+    if info.get("hashfull") is not None:
+        bits.append(f"Hash {info['hashfull'] / 10:.0f}%")
+    return "  |  ".join(bits) or "Engine: no data"
+
+
+# --- move quality ------------------------------------------------------------
+
+PIECE_VALUES = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+                chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0}
+QUALITY_ORDER = ["Brilliant", "Best", "Excellent", "Good", "Inaccuracy", "Mistake", "Blunder"]
+CP_CAP = 1000
+
+
+def score_cp(score, color):
+    """Centipawns from `color`'s point of view, with mates capped."""
+    value = score.pov(color).score(mate_score=CP_CAP)
+    return max(-CP_CAP, min(CP_CAP, value))
+
+
+def find_played_move(before, after):
+    """The legal move that turns `before` into `after` (or None)."""
+    target = after.board_fen()
+    for m in before.legal_moves:
+        b = before.copy(stack=False)
+        b.push(m)
+        if b.board_fen() == target:
+            return m
+    return None
+
+
+def looks_like_sacrifice(before, move):
+    """Rough test: a piece moved onto an attacked square for less than it is worth."""
+    piece = before.piece_at(move.from_square)
+    if piece is None or piece.piece_type in (chess.PAWN, chess.KING):
+        return False
+    after = before.copy(stack=False)
+    after.push(move)
+    if not after.is_attacked_by(not piece.color, move.to_square):
+        return False
+    captured = before.piece_at(move.to_square)
+    gain = PIECE_VALUES.get(captured.piece_type, 0) if captured else 0
+    return PIECE_VALUES[piece.piece_type] - gain >= 2
+
+
+def classify_move(loss, sacrifice, best_cp, after_cp):
+    """Label a move by how many centipawns it gave up versus the engine's best."""
+    if loss <= 10 and sacrifice and best_cp < 400 and after_cp >= -50:
+        return "Brilliant"
+    if loss <= 5:
+        return "Best"
+    if loss <= 25:
+        return "Excellent"
+    if loss <= 60:
+        return "Good"
+    if best_cp >= 600 and after_cp >= 600:
+        return "Good"  # already completely winning; don't nitpick
+    if loss <= 120:
+        return "Inaccuracy"
+    if loss <= 250:
+        return "Mistake"
+    return "Blunder"
+
+
+def quality_tag(text):
+    for word, tag in (("Brilliant", "brill"), ("Blunder", "error"),
+                      ("Mistake", "warn"), ("Inaccuracy", "warn")):
+        if word in text:
+            return tag
+    return "good"
+
+
+def build_speech_script(text, rate, volume, persona):
+    """PowerShell that speaks `text` with Windows' built-in voices."""
+    rate = max(-10, min(10, int(rate)))
+    volume = max(0, min(100, int(volume)))
+    p = PERSONAS.get(persona) or {}
+    script = (
+        "Add-Type -AssemblyName System.Speech; "
+        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+        f"$s.Rate = {rate}; $s.Volume = {volume}; "
+    )
+    if p.get("gender"):
+        script += (
+            "try { $s.SelectVoiceByHints([System.Speech.Synthesis.VoiceGender]::"
+            + p["gender"]
+            + ") } catch { }; "
+        )
+    if p.get("pitch"):
+        ssml = (
+            '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis"'
+            ' xml:lang="en-US">'
+            f'<prosody pitch="{p["pitch"]}" rate="{p["rate"]}">'
+            f"{html.escape(text, quote=False)}</prosody></speak>"
+        )
+        script += "$s.SpeakSsml('" + ssml.replace("'", "''") + "');"
+    else:
+        safe = text.replace("'", "''").replace('"', "")
+        script += f"$s.Speak('{safe}');"
+    return script
+
+
+class SpeechQueue:
+    """Speaks one thing at a time, in order, on its own thread.
+
+    - A new move interrupts (cuts off) an older one, so fast play never
+      leaves you hearing stale advice or overlapping voices.
+    - Anything queued before an interruption is dropped.
+    - Asking for the very same line that is already playing is ignored."""
+
+    def __init__(self, on_error=None):
+        self._q = queue.Queue()
+        self._lock = threading.Lock()
+        self._proc = None
+        self._cancelled = False
+        self._current = None
+        self._seq = 0
+        self._min_seq = 0
+        self._on_error = on_error
+        self._edge_warned = False
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def say(self, text, rate=0, volume=100, persona="Plain", interrupt=True, neural=False):
+        with self._lock:
+            self._seq += 1
+            seq = self._seq
+            if interrupt:
+                self._min_seq = seq  # everything older is now stale
+        if interrupt:
+            self._drain()
+            self.cancel_current()
+        self._q.put((seq, text, rate, volume, persona, neural))
+
+    def is_speaking(self, text=None):
+        with self._lock:
+            return self._current is not None and (text is None or self._current == text)
+
+    def cancel_current(self):
+        with self._lock:
+            proc = self._proc
+            if proc is not None and proc.poll() is None:
+                self._cancelled = True
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
+    def _drain(self):
+        try:
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _worker(self):
+        while True:
+            seq, text, rate, volume, persona, neural = self._q.get()
+            with self._lock:
+                if seq < self._min_seq:
+                    continue  # superseded while waiting
+            try:
+                self._speak_one(seq, text, rate, volume, persona, neural)
+            except Exception as e:
+                self._report(str(e))
+
+    def _speak_one(self, seq, text, rate, volume, persona, neural=False):
+        script = None
+        mp3 = None
+        if neural and edge_tts is not None:
+            try:
+                mp3 = os.path.join(
+                    tempfile.gettempdir(), f"haunted_sf_voice_{os.getpid()}.mp3"
+                )
+                synth_edge_mp3(text, rate, persona, mp3)
+                script = build_mp3_play_script(mp3, volume)
+            except Exception as e:
+                mp3 = None
+                if not self._edge_warned:
+                    self._edge_warned = True
+                    self._report(
+                        f"Neural voice failed ({type(e).__name__}); "
+                        "using the Windows voice instead."
+                    )
+        with self._lock:
+            if seq < self._min_seq:
+                return  # superseded while the neural voice was being generated
+        if script is None:
+            script = build_speech_script(text, rate, volume, persona)
+        with self._lock:
+            self._cancelled = False
+            self._current = text
+            self._proc = subprocess.Popen(
+                ["powershell", "-NoProfile", "-STA", "-Command", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            proc = self._proc
+        try:
+            _, err = proc.communicate()
+        finally:
+            with self._lock:
+                cancelled = self._cancelled
+                self._proc = None
+                self._current = None
+                self._cancelled = False
+        if mp3:
+            try:
+                os.remove(mp3)
+            except OSError:
+                pass
+        if proc.returncode != 0 and not cancelled:
+            self._report((err or "unknown PowerShell error").strip()[:200])
+
+    def _report(self, message):
+        if self._on_error:
+            try:
+                self._on_error(message)
+            except Exception:
+                pass
+
+
+class Ambience:
+    """A quiet looping wind-and-creaks track, generated on the fly (no files to
+    download). Windows only (uses winsound)."""
+
+    RATE = 16000
+    SECONDS = 8
+
+    def __init__(self):
+        self.path = os.path.join(tempfile.gettempdir(), "haunted_stockfish_wind.wav")
+        self.playing = False
+
+    @property
+    def available(self):
+        return winsound is not None
+
+    def build_wav(self, path=None):
+        path = path or self.path
+        rate, n = self.RATE, self.RATE * self.SECONDS
+        xfade = rate // 2
+        rnd = random.Random(99)
+        two_pi = 2 * math.pi
+        lp1 = lp2 = 0.0
+        ext = []
+        for i in range(n + xfade):
+            lp1 += 0.045 * (rnd.uniform(-1, 1) - lp1)
+            lp2 += 0.020 * (lp1 - lp2)
+            t = i / rate
+            gust = 0.45 + 0.30 * math.sin(two_pi * t / 8.0 + 0.4) + 0.20 * math.sin(two_pi * t / 2.0)
+            ext.append(lp2 * gust)
+        # Cross-fade the tail into the head so the loop has no click.
+        out = []
+        for i in range(n):
+            if i < xfade:
+                w = i / xfade
+                out.append(ext[i] * w + ext[n + i] * (1 - w))
+            else:
+                out.append(ext[i])
+        # A couple of old-wood creaks.
+        for start in (2.4, 5.9):
+            length = int(0.7 * rate)
+            s0 = int(start * rate)
+            phase = 0.0
+            for k in range(length):
+                u = k / length
+                freq = 150 - 55 * u + 12 * math.sin(two_pi * 9 * u)
+                phase += two_pi * freq / rate
+                env = math.sin(math.pi * u) ** 2
+                out[s0 + k] += 0.085 * env * (math.sin(phase) + 0.4 * math.sin(2.02 * phase))
+        peak = max(abs(v) for v in out) or 1.0
+        scale = 0.30 * 32767 / peak
+        samples = array.array("h", [int(v * scale) for v in out])
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            wf.writeframes(samples.tobytes())
+        return path
+
+    def start(self):
+        if winsound is None:
+            return False
+        try:
+            if not os.path.exists(self.path) or os.path.getsize(self.path) < 1000:
+                self.build_wav()
+            winsound.PlaySound(
+                self.path,
+                winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP,
+            )
+            self.playing = True
+            return True
+        except Exception:
+            return False
+
+    def stop(self):
+        if winsound is None:
+            return
+        try:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+        self.playing = False
+
+
+# ---------------------------------------------------------------------------
+# The animated haunted scene
+# ---------------------------------------------------------------------------
+
+def _hex_to_rgb(color):
+    color = color.lstrip("#")
+    return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def lerp_color(c1, c2, t):
+    t = max(0.0, min(1.0, t))
+    a, b = _hex_to_rgb(c1), _hex_to_rgb(c2)
+    return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+class HauntedScene:
+    """A haunted graveyard on a Tk canvas: bats and ghosts drift past, skeletons
+    dance, pumpkins and windows flicker, lightning strikes, a spider dangles,
+    fog rolls, wisps float. Move the mouse over it for sparks; click it for a
+    burst of bats. The `fear` value (0-1, from the engine's evaluation) makes
+    it stormier and redder."""
+
+    FPS = 30
+    BAT_FILL = "#0b0613"
+    BAT_EDGE = "#7a4cc0"
+    BONE = "#e8e2cf"
+
+    def __init__(self, root, canvas, width, height):
+        self.root = root
+        self.c = canvas
+        self.W = width
+        self.H = height
+        self.ground = height - 26
+
+        self.enabled = True
+        self.level = 6          # 1-10: how crowded / stormy
+        self.sparks = True
+        self.fear = 0.0         # 0-1
+
+        self._job = None
+        self._t = 0.0
+        self._last = time.perf_counter()
+        self._err_logged = False
+        self._fear_bucket = None
+        self._flash_windows = []
+        self._next_flash = time.perf_counter() + random.uniform(4, 9)
+        self._title_flicker = []
+        self._next_title_flicker = time.perf_counter() + random.uniform(3, 7)
+        self._last_spark = 0.0
+        self._last_burst = 0.0
+
+        self.particles = []
+        self.temp_bats = []
+        self.bats = []
+        self.ghosts = []
+        self.wisps = []
+        self.windows = []
+        self.pumpkins = []
+        self.skeletons = []
+
+        self._build()
+        canvas.bind("<Motion>", self._on_motion)
+        canvas.bind("<Button-1>", self._on_click)
+        self.apply_level()
+
+    # ------------------------------------------------------------------
+    # Scene construction
+    # ------------------------------------------------------------------
+
+    def _build(self):
+        c, W, H, G = self.c, self.W, self.H, self.ground
+        rnd = random.Random(13)
+
+        # Night sky: a stepped gradient.
+        bands = 18
+        for i in range(bands):
+            col = lerp_color("#06030c", "#46215f", (i / (bands - 1)) ** 1.35)
+            c.create_rectangle(0, i * H / bands, W, (i + 1) * H / bands + 1,
+                               fill=col, outline="")
+        # Red storm-glow (shown when the position gets scary) and lightning.
+        self.fear_glow = c.create_rectangle(
+            0, H * 0.30, W, H, fill="#c0102c", outline="", stipple="gray12", state="hidden")
+        self.flash = c.create_rectangle(
+            0, 0, W, H, fill="#d8c8ff", outline="", stipple="gray50", state="hidden")
+
+        # Stars.
+        self.stars = []
+        for _ in range(36):
+            x, y = rnd.uniform(4, W - 4), rnd.uniform(3, H * 0.5)
+            r = rnd.choice((0.7, 1.0, 1.4))
+            item = c.create_oval(x - r, y - r, x + r, y + r, fill="#8d7bb0", outline="")
+            self.stars.append((item, rnd.uniform(0, 6.28), rnd.uniform(1.2, 3.0)))
+
+        # Moon with a pulsing glow.
+        mx, my, mr = W * 0.83, 52, 23
+        self.moon = (mx, my, mr)
+        self.moon_glow = []
+        for extra, stip in ((20, "gray12"), (11, "gray25")):
+            gid = c.create_oval(mx - mr - extra, my - mr - extra, mx + mr + extra,
+                                my + mr + extra, fill="#ffe9a8", outline="", stipple=stip)
+            self.moon_glow.append((gid, extra))
+        c.create_oval(mx - mr, my - mr, mx + mr, my + mr, fill="#fff3cf", outline="#fff9e6")
+        for dx, dy, r in ((-8, -6, 5), (7, 4, 6), (-2, 11, 3.5), (9, -10, 2.8)):
+            c.create_oval(mx + dx - r, my + dy - r, mx + dx + r, my + dy + r,
+                          fill="#e6d49c", outline="")
+
+        # Rolling hills.
+        pts = [0, H]
+        for x in range(0, int(W) + 24, 24):
+            pts += [x, G - 30 - 13 * math.sin(x / 61.0 + 0.7) - 7 * math.sin(x / 23.0)]
+        pts += [W, H]
+        c.create_polygon(pts, fill="#180c27", outline="")
+
+        # Haunted houses and bare trees.
+        self._house(W * 0.13, G - 4, 0.55)
+        self._house(W * 0.70, G + 2, 0.92)
+        self._tree(W * 0.43, G, 0.9)
+        self._tree(W * 0.97, G + 2, 1.0)
+        self._tree(W * 0.02, G + 2, 0.85)
+
+        # Creatures of the night (drawn behind the foreground).
+        for i in range(3):
+            self._make_ghost(i, rnd.uniform(0, W), rnd.uniform(40, 100), rnd.uniform(0.9, 1.25))
+        for i in range(7):
+            self.bats.append(self._make_bat(f"bat{i}", rnd.uniform(0, W),
+                                            rnd.uniform(14, 100), rnd.uniform(0.8, 1.35)))
+            b = self.bats[-1]
+            b.update(vx=rnd.choice((-1, 1)) * rnd.uniform(26, 62), base=b["y"],
+                     amp=rnd.uniform(6, 16), freq=rnd.uniform(1.4, 3.2),
+                     phase=rnd.uniform(0, 6.28), flap=0.0)
+
+        # Graveyard ground, grass and tombstones.
+        c.create_rectangle(0, G, W, H, fill="#090510", outline="")
+        for _ in range(70):
+            x = rnd.uniform(0, W)
+            c.create_line(x, G + 1, x + rnd.uniform(-2, 2), G - rnd.uniform(3, 7),
+                          fill="#140b20")
+        self._tomb(W * 0.07, G + 12, 14, 20)
+        self._tomb(W * 0.37, G + 14, 13, 16)
+        self._tomb(W * 0.59, G + 11, 15, 22)
+        self._tomb(W * 0.80, G + 13, 14, 17)
+        self._cross(W * 0.50, G + 12, 1.0)
+        self._cross(W * 0.93, G + 14, 0.9)
+
+        # Back fog (drifts behind the skeletons).
+        self.fog = []
+        for _ in range(4):
+            self._make_fog(rnd, G + rnd.uniform(-4, 6))
+
+        # Dancing skeletons.
+        for x, ph in ((W * 0.20, 0.0), (W * 0.31, 1.7)):
+            self.skeletons.append(self._make_skeleton(x, 0.86, ph))
+
+        # Jack-o'-lanterns.
+        for cx, r in ((W * 0.455, 12), (W * 0.535, 8), (W * 0.885, 15)):
+            self.pumpkins.append(self._make_pumpkin(cx, G + 12, r))
+
+        # Front fog.
+        for _ in range(3):
+            self._make_fog(rnd, G + rnd.uniform(6, 16))
+
+        # Will-o'-the-wisps.
+        for i in range(5):
+            cx, cy = rnd.uniform(30, W - 30), rnd.uniform(G - 30, G - 4)
+            glow = c.create_oval(0, 0, 1, 1, fill="#7dff4f", outline="", stipple="gray25")
+            core = c.create_oval(0, 0, 1, 1, fill="#d6ffbf", outline="")
+            self.wisps.append({"glow": glow, "core": core, "cx": cx, "cy": cy,
+                               "ax": rnd.uniform(14, 40), "ay": rnd.uniform(5, 12),
+                               "ph": rnd.uniform(0, 6.28), "sp": rnd.uniform(0.5, 1.1)})
+
+        # A spider on a thread.
+        self.spider_x = W * 0.29
+        self.spider_thread = c.create_line(self.spider_x, 0, self.spider_x, 30,
+                                           fill="#8a7aa8")
+        self.spider = [c.create_oval(0, 0, 1, 1, fill="#120a1c", outline="#6a4a9a")]
+        for side in (-1, 1):
+            for k in range(4):
+                self.spider.append(c.create_line(0, 0, 1, 1, fill="#6a4a9a"))
+        self.spider_y = 30
+
+        # Title.
+        tx, ty = W / 2, 30
+        font = ("Chiller", 36)
+        self.title_shadow = c.create_text(tx + 2, ty + 2, text="Haunted Stockfish",
+                                          font=font, fill="#2b0f3d")
+        self.title = c.create_text(tx, ty, text="Haunted Stockfish", font=font,
+                                   fill="#ff7518")
+        self.skull_l = c.create_text(tx - 138, ty, text="\u2620", font=("Segoe UI Symbol", 20),
+                                     fill="#ff7518")
+        self.skull_r = c.create_text(tx + 138, ty, text="\u2620", font=("Segoe UI Symbol", 20),
+                                     fill="#ff7518")
+
+    def _house(self, cx, base, s, body="#0b0612", edge="#2a1743"):
+        c = self.c
+
+        def P(*pts):
+            return [(cx + v * s) if i % 2 == 0 else (base + v * s) for i, v in enumerate(pts)]
+
+        c.create_rectangle(*P(-40, -46, 40, 0), fill=body, outline=edge)
+        c.create_polygon(*P(-48, -46, 0, -88, 48, -46), fill=body, outline=edge)
+        c.create_rectangle(*P(-66, -72, -42, 0), fill=body, outline=edge)
+        c.create_polygon(*P(-71, -72, -54, -106, -37, -72), fill=body, outline=edge)
+        c.create_rectangle(*P(22, -88, 33, -60), fill=body, outline=edge)
+        c.create_rectangle(*P(40, -30, 62, 0), fill=body, outline=edge)
+        c.create_polygon(*P(38, -30, 51, -46, 64, -30), fill=body, outline=edge)
+        c.create_rectangle(*P(-6, -18, 6, 0), fill="#1a0d28", outline="")
+        for wx1, wy1, wx2, wy2 in ((-28, -38, -16, -22), (14, -38, 26, -22),
+                                   (-59, -62, -49, -48), (-4, -74, 4, -60),
+                                   (46, -22, 56, -10)):
+            item = c.create_rectangle(*P(wx1, wy1, wx2, wy2), fill="#ffcf5a", outline="")
+            self.windows.append([item, random.uniform(0, 6.28)])
+
+    def _tree(self, x, base, s):
+        segs = [(0, 0, 0, -44), (0, -30, -16, -52), (0, -34, 15, -56), (-9, -44, -22, -58),
+                (8, -46, 20, -70), (0, -44, 3, -74), (-14, -50, -18, -72)]
+        for x1, y1, x2, y2 in segs:
+            width = max(1.0, (3.2 if y1 == 0 else 1.8) * s)
+            self.c.create_line(x + x1 * s, base + y1 * s, x + x2 * s, base + y2 * s,
+                               fill="#0a0510", width=width, capstyle="round")
+
+    def _tomb(self, x, base, w, h):
+        c = self.c
+        fill, edge = "#2d2243", "#41325f"
+        c.create_rectangle(x, base - h, x + w, base, fill=fill, outline=edge)
+        c.create_oval(x, base - h - w / 2, x + w, base - h + w / 2, fill=fill, outline=edge)
+        c.create_rectangle(x + 1, base - h, x + w - 1, base - h + 4, fill=fill, outline="")
+        c.create_text(x + w / 2, base - h + 5, text="RIP", fill="#7b679d",
+                      font=("Segoe UI", 5, "bold"))
+
+    def _cross(self, x, base, s):
+        c = self.c
+        c.create_line(x, base, x, base - 24 * s, fill="#41325f", width=3 * s)
+        c.create_line(x - 7 * s, base - 17 * s, x + 7 * s, base - 17 * s, fill="#41325f",
+                      width=3 * s)
+
+    def _make_fog(self, rnd, y):
+        fw = rnd.uniform(110, 190)
+        fx = rnd.uniform(-60, self.W)
+        item = self.c.create_oval(fx, y, fx + fw, y + rnd.uniform(14, 22),
+                                  fill="#4a336f", outline="", stipple="gray50")
+        self.fog.append({"id": item, "w": fw, "speed": rnd.choice((-1, 1)) * rnd.uniform(5, 12)})
+
+    def _make_bat(self, tag, x, y, size):
+        c = self.c
+
+        def pts(coords):
+            return [(x + v * size) if i % 2 == 0 else (y + v * size) for i, v in enumerate(coords)]
+
+        up_l = (-2, 0, -9, -8, -16, -6, -12, -2, -9, -3, -6, 0)
+        dn_l = (-2, 0, -9, 6, -16, 5, -12, 1, -9, 2, -6, 0)
+
+        def mirror(coords):
+            return tuple(-v if i % 2 == 0 else v for i, v in enumerate(coords))
+
+        kw = dict(fill=self.BAT_FILL, outline=self.BAT_EDGE)
+        for shape, sub in ((up_l, "u"), (mirror(up_l), "u"), (dn_l, "d"), (mirror(dn_l), "d")):
+            c.create_polygon(pts(shape), tags=(tag, f"{tag}_{sub}"), **kw)
+        c.create_oval(pts((-3, -3, 3, 4)), tags=(tag,), **kw)
+        c.create_polygon(pts((-3, -3, -2.5, -8, 0, -4.5, 2.5, -8, 3, -3)), tags=(tag,), **kw)
+        for ex in (-1.6, 1.6):
+            c.create_oval(pts((ex - 0.7, -2, ex + 0.7, -0.6)), fill="#ff4040", outline="",
+                          tags=(tag,))
+        c.itemconfigure(f"{tag}_d", state="hidden")
+        return {"tag": tag, "x": x, "y": y, "up": True, "vis": True}
+
+    def _make_ghost(self, i, x, y, size):
+        c, tag = self.c, f"ghost{i}"
+        body = [(-10, 0), (-9, -12), (0, -17), (9, -12), (10, 0), (10, 13), (6, 9),
+                (3, 14), (0, 9), (-3, 14), (-6, 9), (-10, 13)]
+        flat = []
+        for bx, by in body:
+            flat += [x + bx * size, y + by * size]
+        c.create_polygon(flat, smooth=True, fill="#e6defa", outline="", stipple="gray75",
+                         tags=(tag,))
+        for ex in (-4, 4):
+            c.create_oval(x + (ex - 1.8) * size, y + (-8) * size, x + (ex + 1.8) * size,
+                          y + (-3.5) * size, fill="#150b22", outline="", tags=(tag,))
+        c.create_oval(x - 2 * size, y - 1 * size, x + 2 * size, y + 4 * size,
+                      fill="#150b22", outline="", tags=(tag,))
+        self.ghosts.append({"tag": tag, "x": x, "y": y, "base": y,
+                            "vx": random.choice((-1, 1)) * random.uniform(8, 18),
+                            "ph": random.uniform(0, 6.28), "vis": True})
+
+    def _make_pumpkin(self, cx, base, r):
+        c = self.c
+        cy = base - r * 0.85
+        glow = c.create_oval(cx - r * 2.0, cy - r * 1.9, cx + r * 2.0, cy + r * 1.1,
+                             fill="#ff7518", outline="", stipple="gray12")
+        c.create_oval(cx - r * 1.2, cy - r * 0.85, cx + r * 0.1, cy + r * 0.85,
+                      fill="#e8650f", outline="#9a3f06")
+        c.create_oval(cx - r * 0.1, cy - r * 0.85, cx + r * 1.2, cy + r * 0.85,
+                      fill="#e8650f", outline="#9a3f06")
+        c.create_oval(cx - r * 0.85, cy - r * 0.92, cx + r * 0.85, cy + r * 0.92,
+                      fill="#ff7518", outline="#b84a08")
+        c.create_polygon(cx - r * 0.18, cy - r * 0.9, cx + r * 0.1, cy - r * 1.45,
+                         cx + r * 0.38, cy - r * 0.9, fill="#3f6b17", outline="")
+        face = [
+            c.create_polygon(cx - r * 0.55, cy - r * 0.15, cx - r * 0.2, cy - r * 0.15,
+                             cx - r * 0.38, cy - r * 0.55, fill="#ffe066", outline=""),
+            c.create_polygon(cx + r * 0.55, cy - r * 0.15, cx + r * 0.2, cy - r * 0.15,
+                             cx + r * 0.38, cy - r * 0.55, fill="#ffe066", outline=""),
+            c.create_polygon(cx, cy - r * 0.05, cx - r * 0.1, cy + r * 0.15,
+                             cx + r * 0.1, cy + r * 0.15, fill="#ffe066", outline=""),
+            c.create_polygon(
+                cx - r * 0.6, cy + r * 0.25, cx - r * 0.35, cy + r * 0.55, cx - r * 0.18,
+                cy + r * 0.32, cx, cy + r * 0.58, cx + r * 0.18, cy + r * 0.32,
+                cx + r * 0.35, cy + r * 0.55, cx + r * 0.6, cy + r * 0.25,
+                cx + r * 0.3, cy + r * 0.12, cx - r * 0.3, cy + r * 0.12,
+                fill="#ffe066", outline=""),
+        ]
+        return {"face": face, "glow": glow, "cx": cx, "cy": cy, "r": r,
+                "ph": random.uniform(0, 6.28)}
+
+    def _make_skeleton(self, x, s, phase):
+        c = self.c
+        line = dict(fill=self.BONE, width=max(1.5, 2.1 * s), capstyle="round")
+        sk = {"x": x, "s": s, "ph": phase}
+        sk["skull"] = c.create_oval(0, 0, 1, 1, fill=self.BONE, outline="#b9b29c")
+        sk["jaw"] = c.create_rectangle(0, 0, 1, 1, fill=self.BONE, outline="#b9b29c")
+        sk["eyeL"] = c.create_oval(0, 0, 1, 1, fill="#120a1c", outline="")
+        sk["eyeR"] = c.create_oval(0, 0, 1, 1, fill="#120a1c", outline="")
+        sk["nose"] = c.create_oval(0, 0, 1, 1, fill="#120a1c", outline="")
+        sk["spine"] = c.create_line(0, 0, 1, 1, **line)
+        sk["pelvis"] = c.create_line(0, 0, 1, 1, **line)
+        sk["ribs"] = [c.create_line(0, 0, 1, 1, fill=self.BONE, width=max(1.2, 1.7 * s),
+                                    capstyle="round") for _ in range(3)]
+        sk["arms"] = {side: [c.create_line(0, 0, 1, 1, **line), c.create_line(0, 0, 1, 1, **line)]
+                      for side in (-1, 1)}
+        sk["legs"] = {side: [c.create_line(0, 0, 1, 1, **line), c.create_line(0, 0, 1, 1, **line)]
+                      for side in (-1, 1)}
+        return sk
+
+    # ------------------------------------------------------------------
+    # Public controls
+    # ------------------------------------------------------------------
+
+    def start(self):
+        if self._job is None and self.enabled:
+            self._last = time.perf_counter()
+            self._job = self.c.after(1, self._tick)
+
+    def stop(self):
+        if self._job is not None:
+            try:
+                self.c.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+    def set_enabled(self, on):
+        self.enabled = bool(on)
+        if self.enabled:
+            self.start()
+        else:
+            self.stop()
+            self._clear_particles()
+
+    def set_level(self, level):
+        self.level = max(1, min(10, int(level)))
+        self.apply_level()
+
+    def set_fear(self, fear):
+        self.fear = max(0.0, min(1.0, float(fear)))
+
+    def apply_level(self):
+        L = self.level
+        n_bats = min(len(self.bats), 1 + L // 2)
+        for i, bat in enumerate(self.bats):
+            self._show_bat(bat, i < n_bats)
+        n_ghosts = 0 if L < 3 else 1 if L < 6 else 2 if L < 9 else 3
+        for i, ghost in enumerate(self.ghosts):
+            ghost["vis"] = i < n_ghosts
+            self.c.itemconfigure(ghost["tag"], state="normal" if ghost["vis"] else "hidden")
+        for i, wisp in enumerate(self.wisps):
+            vis = i < L // 2
+            wisp["vis"] = vis
+            state = "normal" if vis else "hidden"
+            self.c.itemconfigure(wisp["glow"], state=state)
+            self.c.itemconfigure(wisp["core"], state=state)
+        spider_state = "normal" if L >= 3 else "hidden"
+        self.c.itemconfigure(self.spider_thread, state=spider_state)
+        for item in self.spider:
+            self.c.itemconfigure(item, state=spider_state)
+        fog_state = "normal" if L >= 2 else "hidden"
+        for fog in self.fog:
+            self.c.itemconfigure(fog["id"], state=fog_state)
+
+    def _show_bat(self, bat, visible):
+        bat["vis"] = visible
+        if not visible:
+            self.c.itemconfigure(bat["tag"], state="hidden")
+            return
+        self.c.itemconfigure(bat["tag"], state="normal")
+        self.c.itemconfigure(f"{bat['tag']}_u", state="normal" if bat["up"] else "hidden")
+        self.c.itemconfigure(f"{bat['tag']}_d", state="hidden" if bat["up"] else "normal")
+
+    # ------------------------------------------------------------------
+    # Mouse effects
+    # ------------------------------------------------------------------
+
+    def _on_motion(self, event):
+        if not (self.enabled and self.sparks):
+            return
+        now = time.perf_counter()
+        if now - self._last_spark < 0.02 or len(self.particles) > 70:
+            return
+        self._last_spark = now
+        for _ in range(2):
+            self._spawn_particle(
+                event.x + random.uniform(-3, 3), event.y + random.uniform(-3, 3),
+                random.uniform(-14, 14), random.uniform(-26, -4),
+                random.uniform(0.45, 0.9), random.uniform(1.6, 3.2),
+                random.choice(("#ff7518", "#ffb347", "#b46bff", "#7dff4f")), gravity=18)
+
+    def _on_click(self, event):
+        now = time.perf_counter()
+        if not self.enabled or now - self._last_burst < 0.8:
+            return
+        self._last_burst = now
+        for k in range(5):
+            ang = random.uniform(0, 6.283)
+            speed = random.uniform(60, 120)
+            bat = self._make_bat(f"tbat{int(now * 1000) % 100000}_{k}", event.x, event.y,
+                                 random.uniform(0.8, 1.2))
+            bat.update(vx=math.cos(ang) * speed, vy=math.sin(ang) * speed - 20,
+                       life=random.uniform(1.6, 2.4), flap=0.0)
+            self.temp_bats.append(bat)
+
+    def _spawn_particle(self, x, y, vx, vy, life, size, color, gravity=0.0):
+        item = self.c.create_oval(x - size, y - size, x + size, y + size, fill=color, outline="")
+        self.particles.append({"id": item, "x": x, "y": y, "vx": vx, "vy": vy, "life": life,
+                               "max": life, "size": size, "color": color, "g": gravity})
+
+    def _clear_particles(self):
+        for p in self.particles:
+            self.c.delete(p["id"])
+        self.particles = []
+        for bat in self.temp_bats:
+            self.c.delete(bat["tag"])
+        self.temp_bats = []
+
+    # ------------------------------------------------------------------
+    # Animation
+    # ------------------------------------------------------------------
+
+    def _tick(self):
+        self._job = None
+        started = time.perf_counter()
+        dt = min(0.1, started - self._last)
+        self._last = started
+        delay = 300
+        try:
+            if self.c.winfo_viewable():
+                self._t += dt
+                try:
+                    self._update(dt, started)
+                except Exception as e:
+                    if not self._err_logged:
+                        print(f"Scene update error: {e}")
+                        self._err_logged = True
+                spent = (time.perf_counter() - started) * 1000
+                delay = max(1, int(1000 / self.FPS - spent))
+        except tk.TclError:
+            return  # window is closing
+        if self.enabled:
+            try:
+                self._job = self.c.after(delay, self._tick)
+            except tk.TclError:
+                pass
+
+    def _update(self, dt, now):
+        c, t, W = self.c, self._t, self.W
+        fear = self.fear
+        speed_mul = 1.0 + fear * 0.8
+
+        # Stars twinkle.
+        for item, ph, sp in self.stars:
+            bright = 0.5 + 0.5 * math.sin(t * sp + ph)
+            c.itemconfigure(item, fill=lerp_color("#4a3d66", "#fff6d8", bright))
+
+        # Moon glow pulses.
+        mx, my, mr = self.moon
+        for k, (gid, extra) in enumerate(self.moon_glow):
+            r = mr + extra + 1.8 * math.sin(t * 1.3 + k)
+            c.coords(gid, mx - r, my - r, mx + r, my + r)
+
+        # Window and pumpkin flicker.
+        for win in self.windows:
+            if random.random() < 0.05:
+                win[1] = random.random()
+                c.itemconfigure(win[0], fill=random.choice(
+                    ("#ffcf5a", "#ff9a1a", "#ffe49a", "#ffcf5a", "#6b3a10")))
+        for pk in self.pumpkins:
+            f = 0.5 + 0.5 * math.sin(t * 7 + pk["ph"]) * random.uniform(0.6, 1.0)
+            col = lerp_color("#ff9a00", "#fff3a0", f)
+            for face in pk["face"]:
+                c.itemconfigure(face, fill=col)
+
+        # Fog drifts.
+        for fog in self.fog:
+            c.move(fog["id"], fog["speed"] * dt, 0)
+            x1 = c.coords(fog["id"])[0]
+            if fog["speed"] > 0 and x1 > W:
+                c.move(fog["id"], -(W + fog["w"] + 20), 0)
+            elif fog["speed"] < 0 and x1 + fog["w"] < 0:
+                c.move(fog["id"], W + fog["w"] + 20, 0)
+
+        # Bats.
+        for bat in self.bats:
+            if bat["vis"]:
+                self._update_bat(bat, dt, speed_mul)
+
+        # Ghosts.
+        for ghost in self.ghosts:
+            if not ghost["vis"]:
+                continue
+            nx = ghost["x"] + ghost["vx"] * dt
+            ny = ghost["base"] + math.sin(t * 1.1 + ghost["ph"]) * 9
+            if nx > W + 25:
+                nx = -25
+            elif nx < -25:
+                nx = W + 25
+            c.move(ghost["tag"], nx - ghost["x"], ny - ghost.get("py", ghost["y"]))
+            ghost["x"], ghost["py"] = nx, ny
+
+        # Wisps.
+        for wisp in self.wisps:
+            if not wisp["vis"]:
+                continue
+            x = wisp["cx"] + wisp["ax"] * math.sin(t * wisp["sp"] + wisp["ph"])
+            y = wisp["cy"] + wisp["ay"] * math.sin(t * wisp["sp"] * 1.7 + wisp["ph"])
+            pulse = 3.4 + 0.9 * math.sin(t * 3 + wisp["ph"])
+            c.coords(wisp["glow"], x - pulse * 2, y - pulse * 2, x + pulse * 2, y + pulse * 2)
+            c.coords(wisp["core"], x - 1.8, y - 1.8, x + 1.8, y + 1.8)
+
+        # Spider bobs on its thread.
+        if self.level >= 3:
+            sy = 26 + 20 * math.sin(t * 0.7)
+            sx = self.spider_x
+            c.coords(self.spider_thread, sx, 0, sx, sy)
+            c.coords(self.spider[0], sx - 3.4, sy - 3, sx + 3.4, sy + 3.4)
+            idx = 1
+            for side in (-1, 1):
+                for k in range(4):
+                    wig = math.sin(t * 6 + k) * 1.2
+                    c.coords(self.spider[idx], sx, sy + 0.5,
+                             sx + side * (5 + k * 1.1), sy - 2 + k * 2 + wig,
+                             sx + side * (8 + k * 1.3), sy + 3 + k * 2 + wig)
+                    idx += 1
+
+        # Skeletons dance.
+        for sk in self.skeletons:
+            self._update_skeleton(sk, t)
+
+        # Embers rise from the pumpkins.
+        if len(self.particles) < 60 and random.random() < 0.05 * self.level * dt * 30 / 6:
+            pk = random.choice(self.pumpkins)
+            self._spawn_particle(pk["cx"] + random.uniform(-4, 4), pk["cy"] - pk["r"],
+                                 random.uniform(-8, 8), random.uniform(-40, -22),
+                                 random.uniform(1.2, 2.0), random.uniform(1.0, 1.8),
+                                 random.choice(("#ffb347", "#ff7518", "#ffe066")))
+
+        self._update_particles(dt)
+        self._update_temp_bats(dt)
+        self._update_lightning(now)
+        self._update_title(now)
+        self._update_fear_glow()
+
+    def _update_bat(self, bat, dt, speed_mul):
+        c, t, W = self.c, self._t, self.W
+        nx = bat["x"] + bat["vx"] * speed_mul * dt
+        ny = bat["base"] + math.sin(t * bat["freq"] + bat["phase"]) * bat["amp"]
+        if nx > W + 30:
+            nx, bat["base"] = -30, random.uniform(14, 100)
+        elif nx < -30:
+            nx, bat["base"] = W + 30, random.uniform(14, 100)
+        c.move(bat["tag"], nx - bat["x"], ny - bat["y"])
+        bat["x"], bat["y"] = nx, ny
+        bat["flap"] += dt
+        if bat["flap"] > 0.11:
+            bat["flap"] = 0.0
+            bat["up"] = not bat["up"]
+            c.itemconfigure(f"{bat['tag']}_u", state="normal" if bat["up"] else "hidden")
+            c.itemconfigure(f"{bat['tag']}_d", state="hidden" if bat["up"] else "normal")
+
+    def _update_temp_bats(self, dt):
+        c = self.c
+        for bat in list(self.temp_bats):
+            bat["life"] -= dt
+            if bat["life"] <= 0:
+                c.delete(bat["tag"])
+                self.temp_bats.remove(bat)
+                continue
+            c.move(bat["tag"], bat["vx"] * dt, bat["vy"] * dt)
+            bat["x"] += bat["vx"] * dt
+            bat["y"] += bat["vy"] * dt
+            bat["flap"] += dt
+            if bat["flap"] > 0.08:
+                bat["flap"] = 0.0
+                bat["up"] = not bat["up"]
+                c.itemconfigure(f"{bat['tag']}_u", state="normal" if bat["up"] else "hidden")
+                c.itemconfigure(f"{bat['tag']}_d", state="hidden" if bat["up"] else "normal")
+
+    def _update_particles(self, dt):
+        c = self.c
+        for p in list(self.particles):
+            p["life"] -= dt
+            if p["life"] <= 0:
+                c.delete(p["id"])
+                self.particles.remove(p)
+                continue
+            p["vy"] += p["g"] * dt
+            p["x"] += p["vx"] * dt
+            p["y"] += p["vy"] * dt
+            frac = p["life"] / p["max"]
+            r = max(0.4, p["size"] * frac)
+            c.coords(p["id"], p["x"] - r, p["y"] - r, p["x"] + r, p["y"] + r)
+            c.itemconfigure(p["id"], fill=lerp_color("#1b0f2b", p["color"], frac))
+
+    def _update_skeleton(self, sk, t):
+        c, s, G = self.c, sk["s"], self.ground
+        w = t * 4.2 + sk["ph"]
+        bob = -abs(math.sin(w)) * 2.6 * s
+        sway = math.sin(w * 0.5) * 2.2 * s
+        base = G + 10  # feet stand a little in front of the ground line
+        x0 = sk["x"]
+        hipx, hipy = x0 + sway * 0.6, base - 27 * s + bob
+        nx, ny = x0 + sway, base - 52 * s + bob
+        hx, hy = x0 + sway * 1.2, base - 62 * s + bob
+
+        c.coords(sk["skull"], hx - 6.8 * s, hy - 7.2 * s, hx + 6.8 * s, hy + 6 * s)
+        c.coords(sk["eyeL"], hx - 4.4 * s, hy - 3.2 * s, hx - 1.2 * s, hy + 0.6 * s)
+        c.coords(sk["eyeR"], hx + 1.2 * s, hy - 3.2 * s, hx + 4.4 * s, hy + 0.6 * s)
+        c.coords(sk["nose"], hx - 0.9 * s, hy + 1.4 * s, hx + 0.9 * s, hy + 3.2 * s)
+        clack = abs(math.sin(w * 2)) * 1.8 * s
+        c.coords(sk["jaw"], hx - 4.6 * s, hy + 5.2 * s, hx + 4.6 * s, hy + 7.6 * s + clack)
+        c.coords(sk["spine"], nx, ny, hipx, hipy)
+        for k, ((dy, wid), rib) in enumerate(zip(((4, 7.5), (8.5, 7.8), (13, 7)), sk["ribs"])):
+            c.coords(rib, nx - wid * s, ny + dy * s, nx + wid * s, ny + dy * s)
+        c.coords(sk["pelvis"], hipx - 4.5 * s, hipy, hipx + 4.5 * s, hipy)
+
+        for side in (-1, 1):
+            shx, shy = nx + side * 5.5 * s, ny + 3 * s
+            a1 = side * 0.55 + 1.15 * math.sin(w + (0 if side < 0 else math.pi))
+            elx, ely = shx + math.sin(a1) * 12 * s, shy + math.cos(a1) * 12 * s
+            a2 = a1 + 0.9 * math.sin(w + 1.2)
+            hdx, hdy = elx + math.sin(a2) * 11 * s, ely + math.cos(a2) * 11 * s
+            upper, fore = sk["arms"][side]
+            c.coords(upper, shx, shy, elx, ely)
+            c.coords(fore, elx, ely, hdx, hdy)
+
+            hpx, hpy = hipx + side * 3.2 * s, hipy
+            b1 = side * 0.16 + 0.4 * math.sin(w + (0 if side < 0 else math.pi))
+            knx, kny = hpx + math.sin(b1) * 13 * s, hpy + math.cos(b1) * 13 * s
+            b2 = b1 * 0.4 - max(0.0, math.sin(w + (0 if side < 0 else math.pi))) * 0.6
+            ftx, fty = knx + math.sin(b2) * 13 * s, kny + math.cos(b2) * 13 * s
+            thigh, shin = sk["legs"][side]
+            c.coords(thigh, hpx, hpy, knx, kny)
+            c.coords(shin, knx, kny, ftx, fty)
+
+    def _update_lightning(self, now):
+        if self.level >= 4 and not self._flash_windows and now >= self._next_flash:
+            self._flash_windows = [(now, now + 0.08), (now + 0.17, now + 0.29)]
+            self._next_flash = now + random.uniform(8, 20) / (1 + self.fear * 2.5)
+        if self._flash_windows:
+            on = any(a <= now <= b for a, b in self._flash_windows)
+            self.c.itemconfigure(self.flash, state="normal" if on else "hidden")
+            if now > self._flash_windows[-1][1]:
+                self._flash_windows = []
+                self.c.itemconfigure(self.flash, state="hidden")
+
+    def _update_title(self, now):
+        if not self._title_flicker and now >= self._next_title_flicker:
+            self._title_flicker = [(now + 0.00, now + 0.06), (now + 0.12, now + 0.17),
+                                   (now + 0.26, now + 0.30)]
+            self._next_title_flicker = now + random.uniform(3, 8) / (1 + self.fear)
+        if self._title_flicker:
+            dim = any(a <= now <= b for a, b in self._title_flicker)
+            col = "#7a3a12" if dim else "#ff7518"
+            for item in (self.title, self.skull_l, self.skull_r):
+                self.c.itemconfigure(item, fill=col)
+            if now > self._title_flicker[-1][1]:
+                self._title_flicker = []
+                for item in (self.title, self.skull_l, self.skull_r):
+                    self.c.itemconfigure(item, fill="#ff7518")
+
+    def _update_fear_glow(self):
+        f = self.fear
+        bucket = 0 if f < 0.3 else 1 if f < 0.5 else 2 if f < 0.75 else 3
+        if bucket != self._fear_bucket:
+            self._fear_bucket = bucket
+            if bucket == 0:
+                self.c.itemconfigure(self.fear_glow, state="hidden")
+            else:
+                stip = ("", "gray12", "gray25", "gray50")[bucket]
+                self.c.itemconfigure(self.fear_glow, state="normal", stipple=stip)
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+
+class LiveChessDashboard(ctk.CTk):
+
+    def __init__(self):
+        super().__init__()
+
+        self.title("Haunted Stockfish")
+        self.geometry("580x880")
+        self.resizable(False, False)
+        self.configure(fg_color=BG)
+
+        cfg = load_config()
+
+        # ----- runtime state -----
+        self.is_running = False
+        self.bot_thread = None
+
+        self.last_spoken_text = None
+        self.last_move_uci = None
+        self.last_moves = []  # best-to-worst list of UCI moves
+
+        # ----- settings (plain attributes so worker threads can read them) -----
+        color = str(cfg.get("color", "Auto"))
+        self.s_color = color if color in ("Auto", "White", "Black") else "Auto"
+        self.s_time = num_setting(cfg, "time", 0.5, 0.1, 5.0)
+        self.s_depth = num_setting(cfg, "depth", 15, 0, 40, int)
+        self.s_use_elo = bool(cfg.get("use_elo", False))
+        self.s_elo = num_setting(cfg, "elo", 1500, 1320, 3000, int)
+        self.s_skill = num_setting(cfg, "skill", 20, 0, 20, int)
+        self.s_overlay = bool(cfg.get("overlay", True))
+        self.s_lines = num_setting(cfg, "lines", 1, 1, 3, int)
+        style = str(cfg.get("style", "Arrows"))
+        self.s_style = style if style in ("Arrows", "Squares") else "Arrows"
+        self.s_test_mode = False  # never saved: you opt in each launch
+
+        mode = OLD_MODE_NAMES.get(str(cfg.get("reveal", INSTANT_MODE)), None)
+        if mode is None:
+            mode = str(cfg.get("reveal", INSTANT_MODE))
+        self.reveal_mode = mode if mode in REVEAL_MODES else INSTANT_MODE
+        self.arrow_delay = num_setting(cfg, "arrow_delay", 1.0, 0.2, 3.0)
+        self.hold_to_hide = num_setting(cfg, "hold", 0.6, 0.3, 1.5)
+        self.arrow_opacity = num_setting(cfg, "opacity", 0.8, 0.3, 1.0)
+        self.voice_rate = num_setting(cfg, "voice_rate", 0, -5, 8, int)
+        self.voice_volume = num_setting(cfg, "voice_volume", 100, 0, 100, int)
+
+        # Spooky extras
+        self.s_scene_on = bool(cfg.get("scene_on", True))
+        self.s_scene_level = num_setting(cfg, "scene_level", 6, 1, 10, int)
+        self.s_sparks = bool(cfg.get("sparks", True))
+        self.s_skull_cursor = bool(cfg.get("skull_cursor", True))
+        self.s_ambience = bool(cfg.get("ambience", False))
+        persona = str(cfg.get("persona", "Plain"))
+        self.persona = persona if persona in PERSONAS else "Plain"
+        self.s_neural = bool(cfg.get("neural", False))
+        self.s_quality = bool(cfg.get("quality", True))
+        self.quality_tally = {}
+        self._telemetry_text = "Engine: idle"
+        self.page_typing = False       # typing in a box on the web page
+        self.fear_value = 0.0
+        self.speaker = SpeechQueue(lambda m: self.log(f"[VOICE ERROR] {m}"))
+        self.ambience = Ambience()
+
+        self.reveal_count = 0        # arrows currently revealed (step mode)
+        self.arrow_show_at = 0.0     # when arrows may appear (delayed mode)
+
+        # ----- keys -----
+        self.hotkey = str(cfg.get("hotkey", DEFAULT_HOTKEY)).lower()
+        self.reveal_key = str(cfg.get("reveal_key", DEFAULT_REVEAL_KEY)).lower()
+        self.recording_target = None  # "repeat", "reveal", or None
+        self._rebind_token = 0
+        self._held = set()
+        self._typing = False          # a text box in this window has focus
+        self._hwnd = None             # this window's handle (Windows)
+        self._hook = None
+        self.key_test_until = 0.0
+        self._reveal_timer = None
+        self._reveal_down = False
+        self._reveal_hold_fired = False
+        self._save_job = None
+        self._ui_queue = queue.Queue()  # worker threads post UI work here
+
+        self._build_ui()
+
+        # Track whether a text box in this window has focus, so a shortcut
+        # doesn't fire while you type. (Only applies while this window is in
+        # front - see _dashboard_in_front.)
+        self.bind("<FocusIn>", self._schedule_focus_check)
+        self.bind("<FocusOut>", self._schedule_focus_check)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self._cache_window_handle()
+        self._install_hotkey_hook()
+        self.after(50, self._drain_ui_queue)
+
+        self.scene.set_level(self.s_scene_level)
+        self.scene.sparks = self.s_sparks
+        self.scene.set_enabled(self.s_scene_on)
+        self._apply_cursor()
+        if self.s_ambience:
+            self.after(900, lambda: self.on_ambience_toggle(True, announce=False))
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        self.f_title = ctk.CTkFont(family="Chiller", size=40)
+        self.f_sub = ctk.CTkFont(family="Segoe UI", size=12)
+        self.f_section = ctk.CTkFont(family="Segoe UI", size=13, weight="bold")
+        self.f_label = ctk.CTkFont(family="Segoe UI", size=13)
+        self.f_value = ctk.CTkFont(family="Segoe UI", size=13, weight="bold")
+        self.f_small = ctk.CTkFont(family="Segoe UI", size=11)
+        self.f_button = ctk.CTkFont(family="Segoe UI", size=14, weight="bold")
+
+        # ----- animated banner -----
+        banner_w, banner_h = 544, 172
+        self.scene_canvas = tk.Canvas(
+            self,
+            width=banner_w,
+            height=banner_h,
+            bg=BG,
+            highlightthickness=2,
+            highlightbackground=PURPLE_DARK,
+            bd=0,
+        )
+        self.scene_canvas.pack(padx=16, pady=(14, 6))
+        self.scene = HauntedScene(self, self.scene_canvas, banner_w, banner_h)
+
+        # ----- status + fear meter -----
+        info = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=12)
+        info.pack(fill="x", padx=16, pady=(0, 6))
+        info.grid_columnconfigure(1, weight=1)
+        self.status_label = ctk.CTkLabel(
+            info,
+            text="  Idle  ",
+            font=self.f_value,
+            text_color=STATUS_COLORS["idle"],
+            fg_color=SURFACE2,
+            corner_radius=12,
+        )
+        self.status_label.grid(row=0, column=0, padx=(10, 8), pady=8)
+        self.fear_bar = ctk.CTkProgressBar(
+            info, height=10, progress_color=SLIME, fg_color=SURFACE2
+        )
+        self.fear_bar.grid(row=0, column=1, sticky="ew", padx=6, pady=8)
+        self.fear_bar.set(0)
+        self.fear_label = ctk.CTkLabel(
+            info, text="Fear: Calm", font=self.f_value, text_color=SLIME, width=110
+        )
+        self.fear_label.grid(row=0, column=2, padx=(6, 12), pady=8)
+        self.telemetry_label = ctk.CTkLabel(
+            info, text="Engine: idle", font=self.f_small, text_color=MUTED,
+            anchor="w", justify="left",
+        )
+        self.telemetry_label.grid(
+            row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 8)
+        )
+
+        # ----- tabs -----
+        self.tabs = ctk.CTkTabview(
+            self,
+            height=300,
+            fg_color=SURFACE,
+            segmented_button_fg_color=SURFACE2,
+            segmented_button_selected_color=PUMPKIN,
+            segmented_button_selected_hover_color=PUMPKIN_HOVER,
+            segmented_button_unselected_color=SURFACE2,
+            segmented_button_unselected_hover_color=PURPLE_DARK,
+            text_color=TEXT,
+            corner_radius=14,
+        )
+        self.tabs.pack(fill="x", padx=16, pady=4)
+        play = self._tab_frame("\u263d Play")
+        engine = self._tab_frame("\u2699 Engine")
+        board = self._tab_frame("\u265e Board")
+        keys = self._tab_frame("\u2328 Keys")
+        spooky = self._tab_frame("\u2620 Spooky")
+
+        self._build_play_tab(play)
+        self._build_engine_tab(engine)
+        self._build_board_tab(board)
+        self._build_keys_tab(keys)
+        self._build_spooky_tab(spooky)
+
+        # ----- start / stop -----
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=16, pady=(8, 2))
+        btn_frame.grid_columnconfigure((0, 1), weight=1)
+
+        self.start_btn = ctk.CTkButton(
+            btn_frame,
+            text="\u25b6  Awaken the Assistant",
+            command=self.start_assistant,
+            fg_color=SLIME_DARK,
+            hover_color="#2f7a18",
+            text_color="#f4fff0",
+            font=self.f_button,
+            height=42,
+            corner_radius=12,
+        )
+        self.start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.stop_btn = ctk.CTkButton(
+            btn_frame,
+            text="\u25a0  Banish It",
+            command=self.stop_assistant,
+            fg_color=BLOOD,
+            hover_color=BLOOD_HOVER,
+            text_color="#fff0f0",
+            font=self.f_button,
+            height=42,
+            corner_radius=12,
+            state="disabled",
+        )
+        self.stop_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        self.progress = ctk.CTkProgressBar(
+            self,
+            mode="indeterminate",
+            height=5,
+            progress_color=SURFACE2,   # hidden until the engine is thinking
+            fg_color=SURFACE2,
+        )
+        self.progress.pack(fill="x", padx=18, pady=(8, 4))
+
+        # ----- activity log -----
+        log_frame = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=14)
+        log_frame.pack(fill="both", expand=True, padx=16, pady=(4, 14))
+        ctk.CTkLabel(
+            log_frame, text="Spirit Log", font=self.f_section, text_color=PUMPKIN
+        ).pack(anchor="w", padx=14, pady=(8, 0))
+        self.log_box = ctk.CTkTextbox(
+            log_frame,
+            font=("Consolas", 11),
+            fg_color="#0b0710",
+            text_color=TEXT,
+            border_width=1,
+            border_color=PURPLE_DARK,
+            corner_radius=10,
+        )
+        self.log_box.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+        for tag, color in (
+            ("move", PUMPKIN),
+            ("error", "#ff6b6b"),
+            ("good", SLIME),
+            ("key", "#c79bff"),
+            ("warn", CANDLE),
+            ("dim", "#6f5d88"),
+            ("brill", "#4dd8ff"),
+        ):
+            self.log_box.tag_config(tag, foreground=color)
+        self.log_box.insert(
+            "0.0", "The crypt is quiet. Adjust your charms, then awaken the assistant.\n", "dim"
+        )
+        self.log_box.configure(state="disabled")
+
+    def _tab_frame(self, name):
+        tab = self.tabs.add(name)
+        frame = ctk.CTkScrollableFrame(
+            tab,
+            fg_color="transparent",
+            scrollbar_button_color=PURPLE_DARK,
+            scrollbar_button_hover_color=PURPLE,
+        )
+        frame.pack(fill="both", expand=True)
+        return frame
+
+    # ----- widget helpers -----
+
+    def _section(self, parent, text):
+        ctk.CTkLabel(
+            parent, text=text, font=self.f_section, text_color=PUMPKIN, anchor="w"
+        ).pack(fill="x", padx=10, pady=(12, 2))
+
+    def _note(self, parent, text):
+        ctk.CTkLabel(
+            parent,
+            text=text,
+            font=self.f_small,
+            text_color=MUTED,
+            anchor="w",
+            justify="left",
+            wraplength=470,
+        ).pack(fill="x", padx=10, pady=(0, 4))
+
+    def _label(self, parent, text):
+        ctk.CTkLabel(
+            parent, text=text, font=self.f_label, text_color=TEXT, anchor="w"
+        ).pack(fill="x", padx=10, pady=(8, 2))
+
+    def _segmented(self, parent, values, current, command):
+        seg = ctk.CTkSegmentedButton(
+            parent,
+            values=values,
+            command=command,
+            fg_color=SURFACE2,
+            selected_color=PUMPKIN,
+            selected_hover_color=PUMPKIN_HOVER,
+            unselected_color=SURFACE2,
+            unselected_hover_color=PURPLE_DARK,
+            text_color=TEXT,
+            font=self.f_label,
+        )
+        seg.pack(fill="x", padx=10, pady=(0, 4))
+        seg.set(current)
+        return seg
+
+    def _switch(self, parent, text, current, command):
+        var = ctk.BooleanVar(value=current)
+        sw = ctk.CTkSwitch(
+            parent,
+            text=text,
+            variable=var,
+            command=lambda: command(bool(var.get())),
+            progress_color=PUMPKIN,
+            button_color=TEXT,
+            button_hover_color="#ffffff",
+            fg_color=SURFACE2,
+            text_color=TEXT,
+            font=self.f_label,
+        )
+        sw.pack(anchor="w", padx=10, pady=(8, 4))
+        return sw
+
+    def _slider(self, parent, label, lo, hi, steps, initial, fmt, on_change):
+        box = ctk.CTkFrame(parent, fg_color="transparent")
+        box.pack(fill="x", padx=10, pady=(6, 2))
+        box.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            box, text=label, font=self.f_label, text_color=TEXT, anchor="w"
+        ).grid(row=0, column=0, sticky="w")
+        value_lbl = ctk.CTkLabel(
+            box, text=fmt(initial), font=self.f_value, text_color=PUMPKIN
+        )
+        value_lbl.grid(row=0, column=1, sticky="e")
+
+        def changed(value):
+            value_lbl.configure(text=fmt(value))
+            on_change(value)
+            self.schedule_save()
+
+        slider = ctk.CTkSlider(
+            box,
+            from_=lo,
+            to=hi,
+            number_of_steps=steps,
+            command=changed,
+            button_color=PUMPKIN,
+            button_hover_color=PUMPKIN_HOVER,
+            progress_color=PUMPKIN,
+            fg_color=SURFACE2,
+        )
+        slider.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        slider.set(initial)
+        return slider
+
+    def _button(self, parent, text, command, **kw):
+        defaults = dict(
+            fg_color=PURPLE,
+            hover_color=PURPLE_DARK,
+            text_color=TEXT,
+            font=self.f_label,
+            height=32,
+            corner_radius=10,
+        )
+        defaults.update(kw)
+        return ctk.CTkButton(parent, text=text, command=command, **defaults)
+
+    # ----- tabs -----
+
+    def _build_play_tab(self, tab):
+        self._section(tab, "Who are you playing as?")
+        self._segmented(
+            tab,
+            ["Auto", "White", "Black"],
+            self.s_color,
+            lambda v: self._set("s_color", v),
+        )
+        self._note(
+            tab,
+            "Auto reads which side is at the bottom of the board, so it keeps"
+            " working when a new bot gives you a new color.",
+        )
+
+        self._section(tab, "Test mode")
+        self._switch(
+            tab,
+            "Test mode: my own other device / account",
+            False,
+            self.on_test_mode_toggle,
+        )
+        self._note(
+            tab,
+            "Off = bot games only (chess.com/play/computer). Turn on only to"
+            " test against your own phone or a second account of yours.",
+        )
+
+        self._section(tab, "How to use")
+        self._note(
+            tab,
+            "1. Awaken the assistant - it opens (or attaches to) Chrome.\n"
+            "2. Open a bot game on chess.com and start playing.\n"
+            "3. On your turn it speaks the move and marks it on the board.",
+        )
+
+    def _build_engine_tab(self, tab):
+        self._section(tab, "Thinking")
+        self._slider(
+            tab, "Think time", 0.1, 5.0, 49, self.s_time,
+            lambda v: f"{float(v):.1f} s",
+            lambda v: setattr(self, "s_time", round(float(v), 1)),
+        )
+        self._slider(
+            tab, "Max depth", 0, 40, 40, self.s_depth,
+            lambda v: "Unlimited" if int(round(float(v))) == 0 else f"{int(round(float(v)))}",
+            lambda v: setattr(self, "s_depth", int(round(float(v)))),
+        )
+
+        self._section(tab, "Telemetry")
+        self._switch(
+            tab, "Grade the opponent's moves in the log", self.s_quality,
+            self.on_quality_toggle,
+        )
+        self._note(
+            tab,
+            "Depth, NPS and hash usage show under the fear meter. Grading runs a"
+            " short extra analysis after each of your suggestions (Brilliant /"
+            " Best / Good / Inaccuracy / Mistake / Blunder).",
+        )
+
+        self._section(tab, "Strength (when showing 1 move)")
+        self._switch(
+            tab,
+            "Limit strength by Elo rating",
+            self.s_use_elo,
+            self.on_elo_toggle,
+        )
+        self.elo_slider = self._slider(
+            tab, "Target Elo", 1320, 3000, 168, self.s_elo,
+            lambda v: f"{int(round(float(v)))}",
+            lambda v: setattr(self, "s_elo", int(round(float(v)))),
+        )
+        self.skill_slider = self._slider(
+            tab, "Skill level", 0, 20, 20, self.s_skill,
+            lambda v: f"{int(round(float(v)))}",
+            lambda v: setattr(self, "s_skill", int(round(float(v)))),
+        )
+        self._apply_strength_widgets()
+        self._note(
+            tab,
+            "When 2 or 3 moves are shown the engine uses full strength.",
+        )
+
+    def _build_board_tab(self, tab):
+        self._section(tab, "On the board")
+        self._switch(
+            tab, "Show the recommended moves", self.s_overlay, self.on_overlay_toggle
+        )
+
+        self._label(tab, "Moves to show")
+        self._segmented(
+            tab, ["1", "2", "3"], str(self.s_lines), self.on_lines_change
+        )
+        ctk.CTkLabel(
+            tab,
+            text="Green = best     Yellow = 2nd     Red = 3rd",
+            font=self.f_small,
+            text_color=MUTED,
+            anchor="w",
+        ).pack(fill="x", padx=10, pady=(0, 4))
+
+        self._label(tab, "Style")
+        self._segmented(
+            tab, ["Arrows", "Squares"], self.s_style, self.on_style_change
+        )
+
+        self._section(tab, "When do they appear?")
+        self._segmented(tab, REVEAL_MODES, self.reveal_mode, self.on_reveal_mode_change)
+        self._note(
+            tab,
+            "Instant: right away.   Delayed: after the wait below.   Step by"
+            " step: tap your Reveal key for each arrow (see Keys tab).",
+        )
+        self._slider(
+            tab, "Delay before arrows (Delayed mode)", 0.2, 3.0, 28, self.arrow_delay,
+            lambda v: f"{float(v):.1f} s",
+            lambda v: setattr(self, "arrow_delay", round(float(v), 1)),
+        )
+        self._slider(
+            tab, "Arrow opacity", 0.3, 1.0, 14, self.arrow_opacity,
+            lambda v: f"{int(round(float(v) * 100))}%",
+            lambda v: setattr(self, "arrow_opacity", round(float(v), 2)),
+        )
+
+    def _build_keys_tab(self, tab):
+        self._section(tab, "Shortcuts")
+        self.keys_status = ctk.CTkLabel(
+            tab, text="", font=self.f_small, anchor="w", justify="left", wraplength=470
+        )
+        self.keys_status.pack(fill="x", padx=10, pady=(0, 4))
+
+        row1 = ctk.CTkFrame(tab, fg_color="transparent")
+        row1.pack(fill="x", padx=10, pady=4)
+        row1.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            row1, text="Repeat the last move", font=self.f_label, text_color=TEXT
+        ).grid(row=0, column=0, sticky="w")
+        self.hotkey_btn = self._button(
+            row1, self.hotkey_label(), lambda: self.begin_rebind("repeat"), width=150
+        )
+        self.hotkey_btn.configure(fg_color=SURFACE2)
+        self.hotkey_btn.grid(row=0, column=1, sticky="e")
+
+        row2 = ctk.CTkFrame(tab, fg_color="transparent")
+        row2.pack(fill="x", padx=10, pady=4)
+        row2.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            row2, text="Reveal arrows (Step by step)", font=self.f_label, text_color=TEXT
+        ).grid(row=0, column=0, sticky="w")
+        self.reveal_btn = self._button(
+            row2, self.reveal_label(), lambda: self.begin_rebind("reveal"), width=150
+        )
+        self.reveal_btn.configure(fg_color=SURFACE2)
+        self.reveal_btn.grid(row=0, column=1, sticky="e")
+
+        self._note(
+            tab,
+            "Click a key button, then press the key you want (Esc cancels)."
+            " The Reveal key only does something when Board > When do they"
+            " appear? is set to Step by step. Tap = next arrow, hold = hide all.",
+        )
+        self._slider(
+            tab, "Hold-to-hide time", 0.3, 1.5, 12, self.hold_to_hide,
+            lambda v: f"{float(v):.1f} s",
+            lambda v: setattr(self, "hold_to_hide", round(float(v), 1)),
+        )
+        self._button(tab, "Test my keys", self.test_keys, width=150).pack(
+            anchor="w", padx=10, pady=(8, 2)
+        )
+        self._note(
+            tab,
+            "Test my keys: for 8 seconds, every key the listener hears is"
+            " shown in the log - so you can see if it hears Delete and Q.",
+        )
+
+        self._section(tab, "Voice")
+        self._slider(
+            tab, "Speed", -5, 8, 13, self.voice_rate,
+            lambda v: f"{int(round(float(v))):+d}",
+            lambda v: setattr(self, "voice_rate", int(round(float(v)))),
+        )
+        self._slider(
+            tab, "Volume", 0, 100, 20, self.voice_volume,
+            lambda v: f"{int(round(float(v)))}%",
+            lambda v: setattr(self, "voice_volume", int(round(float(v)))),
+        )
+        self._button(tab, "Test the voice", self.test_voice, width=150).pack(
+            anchor="w", padx=10, pady=(8, 8)
+        )
+
+    def _build_spooky_tab(self, tab):
+        self._section(tab, "Haunted scene")
+        self._switch(tab, "Animate the haunted scene", self.s_scene_on, self.on_scene_toggle)
+        self._slider(
+            tab, "Spookiness", 1, 10, 9, self.s_scene_level,
+            lambda v: f"{int(round(float(v)))}",
+            lambda v: self.on_scene_level(int(round(float(v)))),
+        )
+        self._switch(
+            tab, "Sparks follow your cursor over the scene", self.s_sparks,
+            self.on_sparks_toggle,
+        )
+        self._switch(
+            tab, "Skull-and-crossbones cursor", self.s_skull_cursor,
+            self.on_skull_cursor_toggle,
+        )
+        self._note(
+            tab,
+            "Click the scene for a surprise. More spookiness = more bats, ghosts,"
+            " wisps and lightning. Turn the scene off if you want the lightest"
+            " possible app.",
+        )
+
+        self._section(tab, "Voice persona")
+        self._segmented(tab, list(PERSONAS), self.persona, self.on_persona_change)
+        self._switch(
+            tab, "Neural voice (edge-tts, needs internet)", self.s_neural,
+            self.on_neural_toggle,
+        )
+        self._button(tab, "Hear the persona", self.test_voice, width=150).pack(
+            anchor="w", padx=10, pady=(6, 2)
+        )
+        self._note(
+            tab,
+            "Personas change the voice (pitch, speed, and male/female if Windows"
+            " has a matching voice) and add commentary on checks, captures,"
+            " castling, promotions and checkmate.",
+        )
+
+        self._section(tab, "Ambience")
+        self._switch(
+            tab, "Haunted wind and creaking wood (Windows)", self.s_ambience,
+            self.on_ambience_toggle,
+        )
+
+        self._section(tab, "Fear meter")
+        self._note(
+            tab,
+            "The bar under the scene shows how scared you should be, from the"
+            " engine's evaluation of your position. As fear rises the sky turns"
+            " red, lightning strikes more often, and the bats fly faster.",
+        )
+
+    def on_scene_toggle(self, value):
+        self.s_scene_on = value
+        self.scene.set_enabled(value)
+        self.schedule_save()
+
+    def on_scene_level(self, level):
+        self.s_scene_level = level
+        self.scene.set_level(level)
+        self.schedule_save()
+
+    def on_sparks_toggle(self, value):
+        self.s_sparks = value
+        self.scene.sparks = value
+        self.schedule_save()
+
+    def on_skull_cursor_toggle(self, value):
+        self.s_skull_cursor = value
+        self._apply_cursor()
+        self.schedule_save()
+
+    def _apply_cursor(self):
+        name = "pirate" if self.s_skull_cursor else ""
+        try:
+            tk.Misc.configure(self, cursor=name)
+            self.scene_canvas.configure(cursor=name)
+        except tk.TclError:
+            # This system has no skull cursor; use the normal one.
+            try:
+                tk.Misc.configure(self, cursor="")
+                self.scene_canvas.configure(cursor="")
+            except tk.TclError:
+                pass
+
+    def on_persona_change(self, value):
+        self.persona = value
+        self.schedule_save()
+        self.log(f"[INFO] Voice persona: {value}.")
+
+    def on_neural_toggle(self, value):
+        self.s_neural = bool(value)
+        self.schedule_save()
+        if value and edge_tts is None:
+            self.log(
+                "[INFO] edge-tts isn't installed, so the Windows voice is used. Run: "
+                f"{sys.executable} -m pip install edge-tts"
+            )
+        else:
+            self.log(f"[INFO] Neural voice {'on' if value else 'off'}.")
+
+    def on_quality_toggle(self, value):
+        self.s_quality = bool(value)
+        self.schedule_save()
+        self.log(f"[INFO] Opponent move grading {'on' if value else 'off'}.")
+
+    def on_ambience_toggle(self, value, announce=True):
+        self.s_ambience = bool(value)
+        self.schedule_save()
+        if not self.ambience.available:
+            if announce:
+                self.log("[INFO] Ambience needs Windows (winsound).")
+            return
+        if value:
+            threading.Thread(target=self._start_ambience, daemon=True).start()
+        else:
+            self.ambience.stop()
+
+    def _start_ambience(self):
+        if not self.ambience.start():
+            self.log("[INFO] Couldn't start the ambience.")
+
+    def set_fear(self, fear):
+        self.post(self._set_fear_now, float(fear))
+
+    def set_telemetry(self, info):
+        self._telemetry_text = telemetry_text(info)
+        self.post(self._refresh_telemetry)
+
+    def _refresh_telemetry(self):
+        text = self._telemetry_text
+        if self.quality_tally:
+            tally = ", ".join(
+                f"{self.quality_tally[k]} {k}" for k in QUALITY_ORDER if k in self.quality_tally
+            )
+            text += "\nOpponent moves: " + tally
+        self.telemetry_label.configure(text=text)
+
+    def _set_fear_now(self, fear):
+        self.fear_value = fear
+        self.fear_bar.set(fear)
+        if fear < 0.25:
+            label, color = "Calm", SLIME
+        elif fear < 0.5:
+            label, color = "Uneasy", CANDLE
+        elif fear < 0.75:
+            label, color = "Terrified", PUMPKIN
+        else:
+            label, color = "Doomed", "#ff4d4d"
+        self.fear_bar.configure(progress_color=color)
+        self.fear_label.configure(text=f"Fear: {label}", text_color=color)
+        self.scene.set_fear(fear)
+
+    # ------------------------------------------------------------------
+    # Setting callbacks (main thread)
+    # ------------------------------------------------------------------
+
+    def _set(self, name, value):
+        setattr(self, name, value)
+        self.schedule_save()
+
+    def _apply_strength_widgets(self):
+        elo_on = self.s_use_elo
+        self.elo_slider.configure(state="normal" if elo_on else "disabled")
+        self.skill_slider.configure(state="disabled" if elo_on else "normal")
+
+    def on_elo_toggle(self, value):
+        self.s_use_elo = value
+        self._apply_strength_widgets()
+        self.schedule_save()
+
+    def on_overlay_toggle(self, value):
+        self.s_overlay = value
+        self.schedule_save()
+        self.log(f"[INFO] Board display turned {'on' if value else 'off'}.")
+
+    def on_lines_change(self, value):
+        self.s_lines = int(value)
+        self.schedule_save()
+        self.log(f"[INFO] Showing {value} move(s) as {self.s_style.lower()}.")
+
+    def on_style_change(self, value):
+        self.s_style = value
+        self.schedule_save()
+        self.log(f"[INFO] Showing {self.s_lines} move(s) as {value.lower()}.")
+
+    def on_test_mode_toggle(self, value):
+        self.s_test_mode = value
+        if value:
+            self.log(
+                "[INFO] Test mode ON: working on any chess.com game page. This"
+                " is meant for testing against your own other device or"
+                " account, not against other people."
+            )
+        else:
+            self.log("[INFO] Test mode OFF: bot games only.")
+
+    def on_reveal_mode_change(self, value):
+        self.reveal_mode = value
+        self.reveal_count = 0
+        self.arrow_show_at = 0.0
+        self.schedule_save()
+        if value == STEP_MODE:
+            if keyboard is None:
+                self.log(
+                    "[ARROWS] Step by step needs the keyboard package: "
+                    f"{sys.executable} -m pip install keyboard"
+                )
+            else:
+                self.log(
+                    f"[ARROWS] Tap {self.reveal_label()} to reveal the arrows one"
+                    " by one (green, yellow, red). Hold it to hide them all."
+                )
+        elif value == DELAY_MODE:
+            self.log(f"[ARROWS] Arrows appear {self.arrow_delay:.1f}s after the move is found.")
+        else:
+            self.log("[ARROWS] Arrows appear instantly.")
+
+    def schedule_save(self):
+        """Save settings shortly after the last change (main thread only)."""
+        if self._save_job is not None:
+            try:
+                self.after_cancel(self._save_job)
+            except Exception:
+                pass
+        self._save_job = self.after(400, self._do_save)
+
+    def _do_save(self):
+        self._save_job = None
+        save_config({
+            "color": self.s_color,
+            "time": self.s_time,
+            "depth": self.s_depth,
+            "use_elo": self.s_use_elo,
+            "elo": self.s_elo,
+            "skill": self.s_skill,
+            "overlay": self.s_overlay,
+            "lines": self.s_lines,
+            "style": self.s_style,
+            "reveal": self.reveal_mode,
+            "arrow_delay": self.arrow_delay,
+            "hold": self.hold_to_hide,
+            "opacity": self.arrow_opacity,
+            "voice_rate": self.voice_rate,
+            "voice_volume": self.voice_volume,
+            "hotkey": self.hotkey,
+            "reveal_key": self.reveal_key,
+            "scene_on": self.s_scene_on,
+            "scene_level": self.s_scene_level,
+            "sparks": self.s_sparks,
+            "skull_cursor": self.s_skull_cursor,
+            "ambience": self.s_ambience,
+            "persona": self.persona,
+            "neural": self.s_neural,
+            "quality": self.s_quality,
+        })
+
+    # ------------------------------------------------------------------
+    # Log / status (thread-safe)
+    # ------------------------------------------------------------------
+
+    def post(self, fn, *args):
+        """Ask the main thread to run fn(*args). Safe to call from any thread."""
+        self._ui_queue.put((fn, args))
+
+    def _drain_ui_queue(self):
+        """Runs on the main thread: carries out UI work posted by other threads."""
+        try:
+            while True:
+                fn, args = self._ui_queue.get_nowait()
+                try:
+                    fn(*args)
+                except Exception as e:
+                    print(f"UI update error: {e}")
+        except queue.Empty:
+            pass
+        try:
+            self.after(50, self._drain_ui_queue)
+        except Exception:
+            pass
+
+    def log(self, message):
+        self.post(self._log_now, message)
+
+    def _log_now(self, message):
+        text = message.strip()
+        tag = None
+        if ">>>" in text or text.startswith("Best to worst"):
+            tag = "move"
+        elif text.startswith("[ERROR]") or text.startswith("[VOICE ERROR]"):
+            tag = "error"
+        elif text.startswith("[SUCCESS]"):
+            tag = "good"
+        elif text.startswith(("[HOTKEY]", "[ARROWS]", "[KEYTEST]")):
+            tag = "key"
+        elif text.startswith("[PAUSED]"):
+            tag = "warn"
+        elif text.startswith("[QUALITY]"):
+            tag = quality_tag(text)
+        elif text.startswith("[STATS]"):
+            tag = "dim"
+        elif text.startswith("[DEBUG]"):
+            tag = "dim"
+        self.log_box.configure(state="normal")
+        if tag:
+            self.log_box.insert(ctk.END, message + "\n", tag)
+        else:
+            self.log_box.insert(ctk.END, message + "\n")
+        self.log_box.see(ctk.END)
+        self.log_box.configure(state="disabled")
+
+    def set_status(self, text, kind="idle"):
+        self.post(self._set_status_now, text, kind)
+
+    def _set_status_now(self, text, kind):
+        self.status_label.configure(
+            text=f"  {text}  ", text_color=STATUS_COLORS.get(kind, MUTED)
+        )
+
+    def set_thinking(self, on):
+        self.post(self._set_thinking_now, on)
+
+    def _set_thinking_now(self, on):
+        if on:
+            self.progress.configure(progress_color=PUMPKIN)
+            self.progress.start()
+        else:
+            self.progress.stop()
+            self.progress.configure(progress_color=SURFACE2)
+
+    def _set_idle_buttons(self):
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self._set_thinking_now(False)
+        self._set_status_now("Idle", "idle")
+        self._set_fear_now(0.0)
+
+    # ------------------------------------------------------------------
+    # Start / stop
+    # ------------------------------------------------------------------
+
+    def start_assistant(self):
+        if self.is_running:
+            return
+        self.is_running = True
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.set_status("Waking...", "think")
+
+        self.bot_thread = threading.Thread(target=self.run_bot_loop, daemon=True)
+        self.bot_thread.start()
+
+    def stop_assistant(self):
+        self.is_running = False
+        self.post(self._set_idle_buttons)
+        self.log("[INFO] Assistant stopped.")
+
+    def on_close(self):
+        self.is_running = False
+        try:
+            if self._save_job is not None:
+                self.after_cancel(self._save_job)
+            self._do_save()
+        except Exception:
+            pass
+        try:
+            if keyboard is not None:
+                keyboard.unhook_all()
+        except Exception:
+            pass
+        try:
+            self.scene.stop()
+            self.ambience.stop()
+            self.speaker.cancel_current()
+        except Exception:
+            pass
+        self.destroy()
+
+    def say(self, text, interrupt=True):
+        """Queue speech. A newer move cuts off an older one, so you never hear
+        stale advice or two voices at once."""
+        self.speaker.say(
+            text, self.voice_rate, self.voice_volume, self.persona, interrupt,
+            self.s_neural and edge_tts is not None,
+        )
+
+    def test_voice(self):
+        sample, flags = "Knight to F 3, check", {"check"}
+        self.say(compose_speech(self.persona, sample, flags))
+
+    def set_overlay(self, driver, moves, flipped):
+        try:
+            style = "squares" if self.s_style == "Squares" else "arrows"
+            driver.execute_script(
+                SET_OVERLAY_JS,
+                list(moves) if moves else None,
+                bool(flipped),
+                style,
+                self.arrow_opacity,
+            )
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Keyboard shortcuts
+    # ------------------------------------------------------------------
+
+    def hotkey_label(self):
+        return self.hotkey.upper()
+
+    def reveal_label(self):
+        return self.reveal_key.upper()
+
+    def moves_to_draw(self):
+        """Which of the recommended moves should be on the board right now."""
+        if self.reveal_mode == STEP_MODE:
+            return list(self.last_moves[: self.reveal_count])
+        if time.time() < self.arrow_show_at:
+            return []
+        return list(self.last_moves)
+
+    def _cache_window_handle(self):
+        """Remember this window's handle so we can tell when it's in front."""
+        try:
+            import ctypes
+
+            self.update_idletasks()
+            self._hwnd = ctypes.windll.user32.GetAncestor(self.winfo_id(), 2)
+        except Exception:
+            self._hwnd = None
+
+    def _dashboard_in_front(self):
+        """True only if THIS window is the one you're typing in."""
+        if not self._hwnd:
+            return False
+        try:
+            import ctypes
+
+            return ctypes.windll.user32.GetForegroundWindow() == self._hwnd
+        except Exception:
+            return False
+
+    def _schedule_focus_check(self, _event=None):
+        self.after(50, self._check_focus)
+
+    def _check_focus(self):
+        try:
+            self._typing = isinstance(self.focus_get(), tk.Entry)
+        except Exception:
+            self._typing = False
+
+    def _install_hotkey_hook(self):
+        if keyboard is None:
+            msg = (
+                "Key listener is OFF: the 'keyboard' package isn't installed for"
+                " this Python. Run:\n"
+                f"{sys.executable} -m pip install keyboard\nthen restart this app."
+            )
+            self.keys_status.configure(text=msg, text_color="#ff6b6b")
+            self.log("[HOTKEY] Key listener OFF - 'keyboard' isn't installed.")
+            self.log(f"[HOTKEY] Run: {sys.executable} -m pip install keyboard")
+            return
+        try:
+            self._hook = keyboard.hook(self._on_key_event)
+            self.keys_status.configure(
+                text="Key listener is ON. Use 'Test my keys' if a shortcut seems dead.",
+                text_color=SLIME,
+            )
+            self.log(
+                f"[HOTKEY] Key listener ON. {self.hotkey_label()} repeats the last"
+                f" move; {self.reveal_label()} steps through arrows (Step by step"
+                " mode)."
+            )
+        except Exception as e:
+            detail = f"{type(e).__name__}: {e}"
+            self.keys_status.configure(
+                text=f"Key listener failed to start - {detail}", text_color="#ff6b6b"
+            )
+            self.log(f"[HOTKEY] Could not start the key listener - {detail}")
+
+    def test_keys(self):
+        if keyboard is None:
+            self.log(
+                "[KEYTEST] The key listener is off. Run: "
+                f"{sys.executable} -m pip install keyboard"
+            )
+            return
+        self.key_test_until = time.time() + 8
+        self.log(
+            f"[KEYTEST] For 8 seconds: click on Chrome or anywhere, then press"
+            f" {self.hotkey_label()} and {self.reveal_label()}. Heard keys show here."
+        )
+
+    def _on_key_event(self, event):
+        """Runs on the keyboard library's own thread, for every key event."""
+        try:
+            name = (event.name or "").lower()
+            if event.event_type == "up":
+                self._held.discard(name)
+                if name == self.reveal_key:
+                    self._reveal_key_up()
+                return
+            if name in self._held:
+                return  # ignore auto-repeat while the key is held down
+            self._held.add(name)
+
+            if time.time() < self.key_test_until:
+                tag = ""
+                if name == self.hotkey:
+                    tag = "  <- repeat key"
+                elif name == self.reveal_key:
+                    tag = "  <- reveal key"
+                self.log(f"[KEYTEST] heard '{name}'{tag}")
+
+            if self.recording_target:
+                self._finish_rebind(name)
+                return
+
+            # Don't fire while you're typing in one of this window's text
+            # boxes - but only if this window is actually in front.
+            if self._typing and self._dashboard_in_front():
+                return
+            if self.page_typing:
+                return  # you're typing in a box on the web page
+
+            if name == self.hotkey:
+                threading.Thread(target=self.repeat_last_move, daemon=True).start()
+            elif name == self.reveal_key:
+                self._reveal_key_down()
+        except Exception as e:
+            self.log(f"[HOTKEY] Key handler error: {e}")
+
+    # Step-by-step reveal: tap = show the next arrow, hold = hide them all.
+
+    def _reveal_key_down(self):
+        if self.reveal_mode != STEP_MODE:
+            return
+        self._reveal_down = True
+        self._reveal_hold_fired = False
+        timer = threading.Timer(self.hold_to_hide, self._reveal_hold)
+        timer.daemon = True
+        self._reveal_timer = timer
+        timer.start()
+
+    def _reveal_hold(self):
+        if self._reveal_down:
+            self._reveal_hold_fired = True
+            self.reveal_count = 0
+            self.log("[ARROWS] Hidden. Tap the key to show them again.")
+
+    def _reveal_key_up(self):
+        if not self._reveal_down:
+            return
+        self._reveal_down = False
+        if self._reveal_timer is not None:
+            self._reveal_timer.cancel()
+        if self._reveal_hold_fired:
+            return  # it was a hold, not a tap
+        if self.last_moves and self.reveal_count < len(self.last_moves):
+            self.reveal_count += 1
+
+    def repeat_last_move(self):
+        text = self.last_spoken_text
+        if not text:
+            self.log("[HOTKEY] No move has been recommended yet.")
+            return
+        if self.speaker.is_speaking(text):
+            return  # that exact line is already playing
+        try:
+            self.log(f"[HOTKEY] Repeating: {text}")
+        except Exception:
+            pass
+        self.say(text)
+
+    # ----- rebinding -----
+
+    def begin_rebind(self, target="repeat"):
+        if keyboard is None:
+            self.log(
+                "[HOTKEY] Install the keyboard package first: "
+                f"{sys.executable} -m pip install keyboard"
+            )
+            return
+        self.recording_target = target
+        self._rebind_token += 1
+        token = self._rebind_token
+        button = self.hotkey_btn if target == "repeat" else self.reveal_btn
+        button.configure(text="Press a key...", fg_color=PUMPKIN, hover_color=PUMPKIN)
+        self.log("[HOTKEY] Press the key you want to use (Esc cancels).")
+        self.after(10000, self._rebind_timeout, token)
+
+    def _finish_rebind(self, name):
+        target = self.recording_target
+        self.recording_target = None
+        if name == "esc":
+            self.post(self._rebind_done, "[HOTKEY] Cancelled.")
+            return
+        other = self.reveal_key if target == "repeat" else self.hotkey
+        if name == other:
+            self.post(
+                self._rebind_done,
+                f"[HOTKEY] {name.upper()} is already used by the other shortcut."
+                " Pick a different key.",
+            )
+            return
+        if target == "repeat":
+            self.hotkey = name
+            message = f"[HOTKEY] Now using {name.upper()} to repeat the move."
+        else:
+            self.reveal_key = name
+            message = f"[HOTKEY] Now using {name.upper()} to reveal the arrows."
+        self.post(self._rebind_done, message)
+
+    def _rebind_timeout(self, token):
+        if self.recording_target and token == self._rebind_token:
+            self.recording_target = None
+            self._rebind_done("[HOTKEY] Timed out. Keys unchanged.")
+
+    def _rebind_done(self, message):
+        self.hotkey_btn.configure(
+            text=self.hotkey_label(), fg_color=SURFACE2, hover_color=PURPLE_DARK
+        )
+        self.reveal_btn.configure(
+            text=self.reveal_label(), fg_color=SURFACE2, hover_color=PURPLE_DARK
+        )
+        self.schedule_save()
+        self._log_now(message)
+
+    # ------------------------------------------------------------------
+    # Browser attach
+    # ------------------------------------------------------------------
+
+    def attach_to_chrome(self):
+        """Attach to a real Chrome started with a debugging port."""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+        if not port_is_open(DEBUG_PORT):
+            chrome = find_chrome()
+            if not chrome:
+                raise RuntimeError(
+                    "Could not find chrome.exe. Edit CHROME_PATHS at the top "
+                    "of the script."
+                )
+            profile_dir = os.path.join(script_dir, "chrome-debug-profile")
+            self.log("[INFO] Starting your Chrome with a debugging port...")
+            self.log(
+                "[INFO] If Chrome was already open, close ALL Chrome windows "
+                "first."
+            )
+            subprocess.Popen([
+                chrome,
+                f"--remote-debugging-port={DEBUG_PORT}",
+                f"--user-data-dir={profile_dir}",
+                START_URL,
+            ])
+
+            for _ in range(30):
+                if port_is_open(DEBUG_PORT):
+                    break
+                time.sleep(0.5)
+            else:
+                raise RuntimeError(
+                    "Chrome didn't open the debugging port. Close every Chrome "
+                    "window (check the system tray too) and try again."
+                )
+        else:
+            self.log("[INFO] Found Chrome already running with debug port.")
+
+        opts = Options()
+        opts.debugger_address = f"127.0.0.1:{DEBUG_PORT}"
+        driver = webdriver.Chrome(options=opts)
+
+        # Make sure we're controlling the chess.com tab, not a blank one.
+        for handle in driver.window_handles:
+            driver.switch_to.window(handle)
+            if "chess.com" in driver.current_url:
+                break
+        self.log(f"[INFO] Attached. Current page: {driver.current_url}")
+        return driver
+
+    # ------------------------------------------------------------------
+    # Main loop (worker thread)
+    # ------------------------------------------------------------------
+
+    def grade_opponent_move(self, engine, before, after, game_token, think_time):
+        """Compare the opponent's last move with Stockfish's best move for that position."""
+        move = find_played_move(before, after)
+        if move is None:
+            self.log("[DEBUG] Couldn't work out the opponent's last move - not graded.")
+            return
+        mover = before.turn
+        san = before.san(move)
+        limit = chess.engine.Limit(time=max(0.1, min(0.4, float(think_time))))
+        engine.configure({"UCI_LimitStrength": False, "Skill Level": 20})
+        info_before = engine.analyse(before, limit, game=game_token)
+        info_after = engine.analyse(after, limit, game=game_token)
+        if "score" not in info_before or "score" not in info_after:
+            return
+        best_cp = score_cp(info_before["score"], mover)
+        after_cp = score_cp(info_after["score"], mover)
+        pv = info_before.get("pv") or []
+        best_move = pv[0] if pv else None
+        loss = 0 if best_move == move else max(0, best_cp - after_cp)
+        label = classify_move(loss, looks_like_sacrifice(before, move), best_cp, after_cp)
+
+        note = f"[QUALITY] Opponent played {san}: {label} (their eval {after_cp / 100:+.2f}"
+        if loss >= 60:
+            note += f", gave up {loss / 100:.2f}"
+        note += ")"
+        if label in ("Inaccuracy", "Mistake", "Blunder") and best_move is not None:
+            note += f" - best was {before.san(best_move)}"
+        self.log(note)
+        self.quality_tally[label] = self.quality_tally.get(label, 0) + 1
+        self.post(self._refresh_telemetry)
+
+    def run_bot_loop(self):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        stockfish_path = os.path.join(script_dir, "stockfish.exe")
+
+        if not os.path.exists(stockfish_path):
+            self.log(f"[ERROR] Could not find stockfish.exe in: {script_dir}")
+            self.set_status("No engine", "error")
+            self.stop_assistant()
+            return
+
+        self.log("[INFO] Starting (your side is auto-detected from the board)...")
+
+        driver = None
+        engine = None
+        try:
+            driver = self.attach_to_chrome()
+
+            self.log("[INFO] Loading Stockfish engine...")
+            engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+            try:
+                engine.configure({"Hash": 128})
+            except Exception:
+                pass
+
+            self.log(
+                "[SUCCESS] Attached! Start a bot game and play. Moves will be"
+                " announced on your turn."
+            )
+            self.set_status("Watching", "run")
+            self.say("Stockfish active and watching the board.", interrupt=False)
+
+            user_turn = chess.WHITE
+            last_side = None
+            was_at_start = False
+            game_token = object()
+            last_acted_key = None
+            rec_key = None
+            last_lines = None
+            redo_silent = False
+            pending_key = None
+            last_logged_key = None
+            last_error = None
+            paused_logged = False
+            prev_fear = None
+            opp_pre = None  # last position seen with the opponent to move
+
+            while self.is_running:
+                try:
+                    # Only operate on chess.com bot games (or test mode).
+                    if not find_computer_tab(driver, self.s_test_mode):
+                        if not paused_logged:
+                            self.log(
+                                "[PAUSED] Not on a chess.com bot game. Open a"
+                                " game at chess.com/play/computer, or turn on"
+                                " Test mode to use it against your own other"
+                                " device."
+                            )
+                            paused_logged = True
+                            self.set_status("Paused", "pause")
+                        self.set_overlay(driver, None, False)
+                        time.sleep(1.0)
+                        continue
+                    if paused_logged:
+                        self.log("[INFO] Bot game page found - resuming.")
+                        paused_logged = False
+                        self.set_status("Watching", "run")
+
+                    use_elo = self.s_use_elo
+                    elo = max(1320, min(3000, int(self.s_elo)))
+                    skill = max(0, min(20, int(self.s_skill)))
+                    think_time = float(self.s_time)
+                    depth = int(self.s_depth) or None
+
+                    state = driver.execute_script(READ_BOARD_JS)
+                    self.page_typing = bool((state or {}).get("typing"))
+                    board = board_from_dom(state)
+
+                    if board is None:
+                        time.sleep(0.5)
+                        continue
+
+                    # Which side are you? "Auto" reads the board orientation,
+                    # so it updates itself when a new game gives you a new color.
+                    choice = self.s_color
+                    if choice == "White":
+                        user_turn = chess.WHITE
+                    elif choice == "Black":
+                        user_turn = chess.BLACK
+                    elif state.get("flipped") is None:
+                        time.sleep(0.5)
+                        continue
+                    else:
+                        user_turn = chess.BLACK if state["flipped"] else chess.WHITE
+
+                    if user_turn != last_side:
+                        self.log(
+                            "[INFO] You are playing"
+                            f" {'White' if user_turn == chess.WHITE else 'Black'}."
+                        )
+                        last_side = user_turn
+
+                    # New game: the starting position just appeared.
+                    at_start = board.board_fen() == chess.STARTING_BOARD_FEN
+                    if at_start and not was_at_start:
+                        if last_acted_key is not None:
+                            self.log("[INFO] New game detected - resetting.")
+                        last_acted_key = None
+                        game_token = object()
+                        prev_fear = None
+                        opp_pre = None
+                        self.quality_tally = {}
+                        self.post(self._refresh_telemetry)
+                    was_at_start = at_start
+
+                    key = board.fen() + (" me-w" if user_turn == chess.WHITE else " me-b")
+
+                    if key != last_logged_key:
+                        self.log(f"[DEBUG] Position: {board.fen()}")
+                        last_logged_key = key
+
+                    # Board display: only shown while the position still
+                    # matches the one the moves were recommended for.
+                    flipped = state.get("flipped")
+                    if flipped is None:
+                        flipped = user_turn == chess.BLACK
+                    show_arrow = (
+                        self.s_overlay and rec_key == key and bool(self.last_moves)
+                    )
+                    self.set_overlay(
+                        driver, self.moves_to_draw() if show_arrow else None, flipped
+                    )
+
+                    # Debounce: the position must be identical on two reads
+                    # in a row (avoids reacting mid-animation).
+                    if key != pending_key:
+                        pending_key = key
+                        time.sleep(0.3)
+                        continue
+
+                    # Remember the position the opponent is about to move from,
+                    # so their reply can be graded on your next turn.
+                    if board.turn != user_turn and not board.is_game_over():
+                        opp_pre = board.copy(stack=False)
+
+                    # If you change "Moves to show" mid-position, redo the
+                    # current position silently so the board updates.
+                    cur_lines = max(1, min(3, int(self.s_lines)))
+                    if (
+                        last_lines is not None
+                        and cur_lines != last_lines
+                        and rec_key == key
+                    ):
+                        last_acted_key = None
+                        redo_silent = True
+                    last_lines = cur_lines
+
+                    if (
+                        key != last_acted_key
+                        and board.turn == user_turn
+                        and not board.is_game_over()
+                    ):
+                        n_lines = cur_lines
+                        score = None
+                        stats = {}
+                        self.set_status("Thinking...", "think")
+                        self.set_thinking(True)
+                        try:
+                            if n_lines == 1:
+                                # Single move: honours the Elo / Skill settings.
+                                if use_elo:
+                                    engine.configure({
+                                        "UCI_LimitStrength": True,
+                                        "UCI_Elo": elo,
+                                    })
+                                    strength = f"Elo: {elo}"
+                                else:
+                                    engine.configure({
+                                        "UCI_LimitStrength": False,
+                                        "Skill Level": skill,
+                                    })
+                                    strength = f"Skill: {skill}"
+
+                                self.log(
+                                    f"\nYour turn! Thinking ({strength}, Time:"
+                                    f" {think_time}s, Depth: {depth or 'Max'})..."
+                                )
+                                result = engine.play(
+                                    board,
+                                    chess.engine.Limit(time=think_time, depth=depth),
+                                    game=game_token,
+                                    info=chess.engine.INFO_ALL,
+                                )
+                                best = result.move
+                                moves_uci = [best.uci()]
+                                score = (result.info or {}).get("score")
+                                stats = result.info or {}
+                            else:
+                                # Several moves: the engine's top lines, best
+                                # first, at full strength.
+                                engine.configure({
+                                    "UCI_LimitStrength": False,
+                                    "Skill Level": 20,
+                                })
+                                self.log(
+                                    f"\nYour turn! Thinking (top {n_lines} moves,"
+                                    f" full strength, Time: {think_time}s, Depth:"
+                                    f" {depth or 'Max'})..."
+                                )
+                                infos = engine.analyse(
+                                    board,
+                                    chess.engine.Limit(time=think_time, depth=depth),
+                                    multipv=n_lines,
+                                    game=game_token,
+                                )
+                                if isinstance(infos, dict):
+                                    infos = [infos]
+                                found = [i["pv"][0] for i in infos if i.get("pv")]
+                                if not found:
+                                    raise RuntimeError("The engine returned no moves.")
+                                best = found[0]
+                                moves_uci = [m.uci() for m in found]
+                                score = next(
+                                    (i.get("score") for i in infos if i.get("pv")), None
+                                )
+                                stats = next((i for i in infos if i.get("pv")), {})
+                        finally:
+                            self.set_thinking(False)
+                            self.set_status("Watching", "run")
+
+                        self.set_telemetry(stats)
+                        self.log("[STATS] " + telemetry_text(stats))
+
+                        # You (or a premove) may have moved while the engine was
+                        # thinking. If so this advice is stale - drop it.
+                        try:
+                            fresh = board_from_dom(driver.execute_script(READ_BOARD_JS))
+                        except Exception:
+                            fresh = None
+                        if fresh is None or fresh.fen() != board.fen():
+                            self.log("[DEBUG] The position changed while thinking - dropped that suggestion.")
+                            last_acted_key = None
+                            time.sleep(0.2)
+                            continue
+
+                        move_str = best.uci()
+
+                        # Natural speech ("Knight to F 3"), flavoured by the persona,
+                        # and the fear meter from the engine's evaluation.
+                        text, flags = describe_move(board, best)
+                        fear = eval_to_fear(score, user_turn) if score is not None else None
+                        alarm = (
+                            fear is not None
+                            and prev_fear is not None
+                            and fear - prev_fear > 0.3
+                        )
+                        if fear is not None:
+                            prev_fear = fear
+                            self.set_fear(fear)
+                        spoken = compose_speech(self.persona, text, flags, alarm)
+
+                        # Remember it for the hotkey and the board display.
+                        self.last_spoken_text = spoken
+                        self.last_move_uci = move_str
+                        self.last_moves = moves_uci
+                        rec_key = key
+                        last_acted_key = key
+
+                        self.log(f">>> RECOMMENDED MOVE: {move_str} <<<")
+                        if len(moves_uci) > 1:
+                            self.log("Best to worst: " + ", ".join(moves_uci))
+
+                        # Decide when the arrows appear.
+                        if not redo_silent:
+                            self.reveal_count = 0
+                            delay = (
+                                self.arrow_delay
+                                if self.reveal_mode == DELAY_MODE
+                                else 0.0
+                            )
+                            self.arrow_show_at = time.time() + delay
+                        else:
+                            self.reveal_count = min(self.reveal_count, len(moves_uci))
+                            self.arrow_show_at = 0.0
+
+                        # Instant mode draws right now; the other modes are
+                        # handled by the loop above.
+                        if self.s_overlay and self.reveal_mode == INSTANT_MODE:
+                            self.set_overlay(driver, moves_uci, flipped)
+
+                        # Speech runs on its own thread, so the loop keeps going.
+                        was_redo = redo_silent
+                        if not redo_silent:
+                            self.say(spoken)
+                        redo_silent = False
+
+                        # Grade the opponent's reply that led to this position.
+                        if self.s_quality and not was_redo and opp_pre is not None:
+                            try:
+                                self.grade_opponent_move(
+                                    engine, opp_pre, board, game_token, think_time
+                                )
+                            except Exception as grade_err:
+                                self.log(f"[DEBUG] Move grading skipped: {grade_err}")
+                        opp_pre = None
+
+                    last_error = None
+
+                except Exception as loop_err:
+                    # Show errors, but don't spam the same one every 0.5s.
+                    msg = str(loop_err).splitlines()[0] if str(loop_err) else repr(loop_err)
+                    if msg != last_error:
+                        self.log(f"[DEBUG] {msg}")
+                        last_error = msg
+
+                waiting = (
+                    self.reveal_mode == DELAY_MODE and time.time() < self.arrow_show_at
+                )
+                time.sleep(0.1 if waiting else 0.5)
+
+        except Exception as e:
+            self.log(f"[ERROR] {e}")
+            self.set_status("Error", "error")
+        finally:
+            # Remove the arrows. Intentionally NOT calling driver.quit():
+            # that would close your real Chrome window.
+            if driver is not None:
+                self.set_overlay(driver, None, False)
+            if engine is not None:
+                try:
+                    engine.quit()
+                except Exception:
+                    pass
+            if self.is_running:
+                self.is_running = False
+                self.post(self._set_idle_buttons)
+
+
+if __name__ == "__main__":
+    app = LiveChessDashboard()
+    app.mainloop()

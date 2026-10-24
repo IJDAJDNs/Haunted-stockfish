@@ -1,7 +1,18 @@
-"""Haunted Stockfish - a Stockfish move assistant for chess.com bot games.
+"""Haunted Stockfish v6 - a Stockfish move assistant for chess.com bot games.
 
 Setup:  python -m pip install -U selenium python-chess customtkinter keyboard edge-tts
 Needs:  stockfish.exe next to this script, and Google Chrome.
+
+TIP: start it with  pythonw chess_assistant_v6.py  (or rename it to .pyw) so no
+black console window exists. The panic key hides the dashboard completely
+(no taskbar icon, not in Alt+Tab) and also hides the console if there is one.
+
+Default keys (all rebindable on the Keys tab):
+  Delete  repeat the move        F9      PANIC: hide / show everything
+  F10     auto-move on/off       End     play the suggested move once
+  F2      explain their last move out loud
+  PageUp  spoken move callouts on/off
+  F6 mute, F7 moves shown, F8 pause, PageDown voice persona, Q reveal arrows
 """
 
 import array
@@ -26,6 +37,8 @@ import chess.engine
 import customtkinter as ctk
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.by import By
 
 try:
     import keyboard  # python -m pip install keyboard
@@ -53,6 +66,18 @@ START_URL = "https://www.chess.com/play/computer"
 ALLOWED_URL_PART = "/computer"
 
 DEFAULT_HOTKEY = "delete"
+
+# Extra shortcuts: action -> (label shown on the Keys tab, default key).
+EXTRA_ACTIONS = {
+    "auto": ("Auto-move on / off", "f10"),
+    "playnow": ("Play the suggested move once", "end"),
+    "explain": ("Explain their last move (spoken)", "f2"),
+    "quality": ("Spoken move callouts on / off", "page up"),
+    "mute": ("Mute / unmute the voice", "f6"),
+    "lines": ("Cycle moves shown (1-2-3)", "f7"),
+    "pause": ("Pause / resume the assistant", "f8"),
+    "persona": ("Next voice persona", "page down"),
+}
 DEFAULT_REVEAL_KEY = "q"
 
 INSTANT_MODE = "Instant"
@@ -94,6 +119,16 @@ BLOOD_HOVER = "#a31f1f"
 CANDLE = "#ffd24a"
 TEXT = "#f3e9ff"
 MUTED = "#9d86b8"
+
+GRADE_COLORS = {
+    "Brilliant": "#4dd8ff",
+    "Best": SLIME,
+    "Excellent": SLIME,
+    "Good": "#b7ff9a",
+    "Inaccuracy": CANDLE,
+    "Mistake": PUMPKIN,
+    "Blunder": "#ff4d4d",
+}
 
 STATUS_COLORS = {
     "idle": MUTED,
@@ -633,6 +668,205 @@ def quality_tag(text):
     return "good"
 
 
+LABEL_PHRASES = {
+    "Brilliant": "a brilliant move",
+    "Best": "the best move in the position",
+    "Excellent": "an excellent move",
+    "Good": "a good move",
+    "Inaccuracy": "a small inaccuracy",
+    "Mistake": "a mistake",
+    "Blunder": "a blunder",
+}
+BAD_LABELS = ("Inaccuracy", "Mistake", "Blunder")
+BIG_LABELS = ("Brilliant", "Mistake", "Blunder")
+QUALITY_SPEECH = {
+    "Brilliant": "Brilliant move from them.",
+    "Best": "They played the best move.",
+    "Excellent": "Excellent move from them.",
+    "Good": "Their last move was good.",
+    "Inaccuracy": "Their last move was a small inaccuracy.",
+    "Mistake": "They made a mistake.",
+    "Blunder": "They blundered!",
+}
+
+
+def quality_speech(label):
+    """The short spoken verdict on the opponent's last move."""
+    return QUALITY_SPEECH.get(label, f"Their last move was {label.lower()}.")
+
+
+def _val(piece_type):
+    """Piece value for attacker comparisons (a king counts as 'very big')."""
+    return PIECE_VALUES.get(piece_type, 0) or 99
+
+
+def _pname(piece):
+    return PIECE_WORDS[piece.piece_type].lower()
+
+
+def hanging_pieces(board, color):
+    """Pieces of `color` that the other side could win for free or at a profit.
+    A rough check (not full exchange maths). Biggest piece first."""
+    found = []
+    for sq, piece in board.piece_map().items():
+        if piece.color != color or piece.piece_type == chess.KING:
+            continue
+        attackers = board.attackers(not color, sq)
+        if not attackers:
+            continue
+        cheapest = min(_val(board.piece_type_at(a)) for a in attackers)
+        if not board.attackers(color, sq) or PIECE_VALUES[piece.piece_type] > cheapest:
+            found.append((sq, piece))
+    found.sort(key=lambda t: -PIECE_VALUES[t[1].piece_type])
+    return found
+
+
+def _standing(cp):
+    """Plain-English verdict on a score from the opponent's point of view."""
+    if cp >= 300:
+        return "They are clearly winning now."
+    if cp >= 120:
+        return "That leaves them a bit better."
+    if cp > -120:
+        return "The position is roughly level."
+    if cp > -300:
+        return "They are still a bit worse."
+    return "They are still in deep trouble."
+
+
+def explain_move(before, move, after, label, loss, best_cp, after_cp, best_move, reply):
+    """A few spoken-style sentences on WHY the opponent's move was good or bad.
+
+    before/after: the positions around their move.  loss: centipawns given up.
+    best_cp/after_cp: scores from their point of view.  best_move: the engine's
+    choice instead.  reply: the engine's best answer for you afterwards."""
+    mover = before.turn
+    said = describe_move(before, move)[0]
+    captured = before.piece_at(move.to_square)
+    if before.is_en_passant(move):
+        captured = chess.Piece(chess.PAWN, not mover)
+    best_said = None
+    if best_move is not None and best_move != move and best_move in before.legal_moves:
+        best_said = describe_move(before, best_move)[0]
+    reasons = []
+
+    if label not in BAD_LABELS:
+        if after.is_checkmate():
+            reasons.append("It delivers checkmate.")
+        else:
+            if label == "Brilliant":
+                reasons.append(
+                    "It gives up material on purpose, but the engine sees it paying off."
+                )
+            elif best_move == move:
+                reasons.append("It is the engine's top choice.")
+            else:
+                reasons.append("It is very close to the engine's top choice.")
+            if captured is not None:
+                reasons.append(f"It takes your {_pname(captured)}.")
+            if after.is_check():
+                reasons.append("It gives check.")
+            if before.is_castling(move):
+                reasons.append("It castles, tucking the king away and connecting the rooks.")
+            elif move.promotion:
+                reasons.append("It promotes a pawn.")
+            else:
+                moved = after.piece_at(move.to_square)
+                threats = []
+                for t in after.attacks(move.to_square):
+                    p = after.piece_at(t)
+                    if (
+                        p is not None
+                        and p.color != mover
+                        and p.piece_type != chess.KING
+                        and moved is not None
+                        and (
+                            not after.attackers(p.color, t)
+                            or PIECE_VALUES[p.piece_type] > PIECE_VALUES[moved.piece_type]
+                        )
+                    ):
+                        threats.append((t, p))
+                threats.sort(key=lambda x: -PIECE_VALUES[x[1].piece_type])
+                piece = before.piece_at(move.from_square)
+                back_rank = 0 if mover == chess.WHITE else 7
+                if threats:
+                    t, p = threats[0]
+                    reasons.append(f"It now attacks your {_pname(p)} on {spoken_square(t)}.")
+                elif (
+                    piece is not None
+                    and piece.piece_type in (chess.KNIGHT, chess.BISHOP)
+                    and chess.square_rank(move.from_square) == back_rank
+                    and before.fullmove_number <= 12
+                ):
+                    reasons.append("It develops a piece.")
+                elif (
+                    piece is not None
+                    and piece.piece_type == chess.PAWN
+                    and chess.square_file(move.to_square) in (3, 4)
+                    and chess.square_rank(move.to_square) in (3, 4)
+                ):
+                    reasons.append("It stakes a claim in the centre.")
+        text = f"Their move, {said}, was {LABEL_PHRASES.get(label, label.lower())}. "
+        text += " ".join(reasons[:3])
+        text += " " + _standing(after_cp)
+        return text.strip()
+
+    # ----- a bad move: find the concrete reason -----
+    if after_cp <= -(CP_CAP - 50):
+        reasons.append("It walks into a forced checkmate.")
+    hang_before = {sq for sq, _ in hanging_pieces(before, mover)}
+    hang_after = hanging_pieces(after, mover)
+    for sq, p in hang_after:
+        if len(reasons) >= 2:
+            break
+        if sq == move.to_square:
+            reasons.append(
+                f"It leaves the {_pname(p)} on {spoken_square(sq)} where you can take it."
+            )
+        elif sq not in hang_before:
+            reasons.append(
+                f"It leaves their {_pname(p)} on {spoken_square(sq)} unprotected."
+            )
+        else:
+            reasons.append(
+                f"It ignores the threat to their {_pname(p)} on {spoken_square(sq)}."
+            )
+    if reply is not None and reply in after.legal_moves and len(reasons) < 2:
+        rc = after.piece_at(reply.to_square)
+        if after.is_en_passant(reply):
+            rc = chess.Piece(chess.PAWN, mover)
+        a2 = after.copy(stack=False)
+        a2.push(reply)
+        rdesc = describe_move(after, reply)[0]
+        if a2.is_checkmate():
+            reasons.append(f"You can now play {rdesc}, which is checkmate.")
+        elif rc is not None:
+            reasons.append(f"You can now play {rdesc}, winning their {_pname(rc)}.")
+    if best_move is not None and best_move != move and best_move in before.legal_moves:
+        b2 = before.copy(stack=False)
+        b2.push(best_move)
+        if b2.is_checkmate():
+            reasons.append(f"They missed checkmate with {best_said}.")
+        elif before.is_capture(best_move) and loss >= 100 and len(reasons) < 2:
+            bc = before.piece_at(best_move.to_square)
+            if before.is_en_passant(best_move):
+                bc = chess.Piece(chess.PAWN, not mover)
+            if bc is not None:
+                reasons.append(
+                    f"They missed a chance to take your {_pname(bc)} with {best_said}."
+                )
+    if not reasons:
+        reasons.append("The engine found a clearly stronger plan.")
+
+    text = f"Their move, {said}, was {LABEL_PHRASES.get(label, label.lower())}."
+    if loss >= 30:
+        text += f" It gave up about {loss / 100:.1f} pawns of advantage."
+    text += " " + " ".join(reasons[:3])
+    if best_said:
+        text += f" The best move was {best_said}."
+    return text.strip()
+
+
 def build_speech_script(text, rate, volume, persona):
     """PowerShell that speaks `text` with Windows' built-in voices."""
     rate = max(-10, min(10, int(rate)))
@@ -707,6 +941,13 @@ class SpeechQueue:
                     proc.terminate()
                 except Exception:
                     pass
+
+    def silence(self):
+        """Stop talking now and forget everything still waiting to be said."""
+        with self._lock:
+            self._min_seq = self._seq + 1
+        self._drain()
+        self.cancel_current()
 
     def _drain(self):
         try:
@@ -890,6 +1131,9 @@ class HauntedScene:
     it stormier and redder."""
 
     FPS = 30
+    # Parallax layers: how far (x, y in pixels) each layer slides against the mouse.
+    AMP = {"far": (2.5, 1.0), "far2": (5.0, 1.5), "mid": (9.0, 2.5),
+           "near": (13.0, 3.5), "fg": (22.0, 6.0)}
     BAT_FILL = "#0b0613"
     BAT_EDGE = "#7a4cc0"
     BONE = "#e8e2cf"
@@ -926,9 +1170,22 @@ class HauntedScene:
         self.windows = []
         self.pumpkins = []
         self.skeletons = []
+        self.fog = []
+        self.rays = []
+        self.parallax = True
+        self.off = {name: (0.0, 0.0) for name in self.AMP}
+        self._px = self._py = 0.0   # eased parallax position (-1..1)
+        self._mx = self._my = 0.0   # mouse target (-1..1)
+        self._hover = False
+        self.thinking = False       # the engine is calculating
+        self.rain = []
+        self._rain_on = False
+        self.toasts = []
+        self._bolt = None
 
         self._build()
         canvas.bind("<Motion>", self._on_motion)
+        canvas.bind("<Leave>", self._on_leave)
         canvas.bind("<Button-1>", self._on_click)
         self.apply_level()
 
@@ -952,6 +1209,7 @@ class HauntedScene:
         self.flash = c.create_rectangle(
             0, 0, W, H, fill="#d8c8ff", outline="", stipple="gray50", state="hidden")
 
+        _far0 = self._begin()
         # Stars.
         self.stars = []
         for _ in range(36):
@@ -973,11 +1231,34 @@ class HauntedScene:
             c.create_oval(mx + dx - r, my + dy - r, mx + dx + r, my + dy + r,
                           fill="#e6d49c", outline="")
 
+        self._end("L_far", _far0)   # stars + moon: the most distant layer
+
+        # Distant mountains (lighter and bluer = further away).
+        _far2 = self._begin()
+        pts = [-60, H + 30]
+        for x in range(-60, int(W) + 80, 18):
+            pts += [x, G - 54 - 22 * abs(math.sin(x / 47.0 + 0.3)) - 9 * math.sin(x / 17.0)]
+        pts += [W + 60, H + 30]
+        c.create_polygon(pts, fill="#2a1745", outline="#3a2160")
+        self._end("L_far2", _far2)
+
+        # Moonlight shafts, swaying slowly (animated every frame).
+        for dxr, wr, ph in ((-70, 20, 0.0), (-135, 15, 2.1), (-195, 11, 4.2)):
+            item = c.create_polygon(0, 0, 1, 1, 2, 2, fill="#ffe9a8", outline="",
+                                    stipple="gray12")
+            self.rays.append({"id": item, "dx": dxr, "w": wr, "ph": ph})
+
+        # Pale mist between the mountains and the hills.
+        for _ in range(3):
+            self._make_fog(rnd, G - 46 + rnd.uniform(-10, 10), color="#5a3d86",
+                           stipple="gray25", slow=0.5)
+
         # Rolling hills.
-        pts = [0, H]
-        for x in range(0, int(W) + 24, 24):
+        _mid0 = self._begin()
+        pts = [-60, H + 30]
+        for x in range(-60, int(W) + 84, 24):
             pts += [x, G - 30 - 13 * math.sin(x / 61.0 + 0.7) - 7 * math.sin(x / 23.0)]
-        pts += [W, H]
+        pts += [W + 60, H + 30]
         c.create_polygon(pts, fill="#180c27", outline="")
 
         # Haunted houses and bare trees.
@@ -986,6 +1267,7 @@ class HauntedScene:
         self._tree(W * 0.43, G, 0.9)
         self._tree(W * 0.97, G + 2, 1.0)
         self._tree(W * 0.02, G + 2, 0.85)
+        self._end("L_mid", _mid0)
 
         # Creatures of the night (drawn behind the foreground).
         for i in range(3):
@@ -998,10 +1280,11 @@ class HauntedScene:
                      amp=rnd.uniform(6, 16), freq=rnd.uniform(1.4, 3.2),
                      phase=rnd.uniform(0, 6.28), flap=0.0)
 
+        _near0 = self._begin()
         # Graveyard ground, grass and tombstones.
-        c.create_rectangle(0, G, W, H, fill="#090510", outline="")
-        for _ in range(70):
-            x = rnd.uniform(0, W)
+        c.create_rectangle(-40, G, W + 40, H + 40, fill="#090510", outline="")
+        for _ in range(80):
+            x = rnd.uniform(-30, W + 30)
             c.create_line(x, G + 1, x + rnd.uniform(-2, 2), G - rnd.uniform(3, 7),
                           fill="#140b20")
         self._tomb(W * 0.07, G + 12, 14, 20)
@@ -1011,8 +1294,9 @@ class HauntedScene:
         self._cross(W * 0.50, G + 12, 1.0)
         self._cross(W * 0.93, G + 14, 0.9)
 
+        self._end("L_near", _near0)
+
         # Back fog (drifts behind the skeletons).
-        self.fog = []
         for _ in range(4):
             self._make_fog(rnd, G + rnd.uniform(-4, 6))
 
@@ -1020,9 +1304,11 @@ class HauntedScene:
         for x, ph in ((W * 0.20, 0.0), (W * 0.31, 1.7)):
             self.skeletons.append(self._make_skeleton(x, 0.86, ph))
 
-        # Jack-o'-lanterns.
+        # Jack-o'-lanterns (they sit on the near-ground layer).
+        _pk0 = self._begin()
         for cx, r in ((W * 0.455, 12), (W * 0.535, 8), (W * 0.885, 15)):
             self.pumpkins.append(self._make_pumpkin(cx, G + 12, r))
+        self._end("L_near", _pk0)
 
         # Front fog.
         for _ in range(3):
@@ -1047,6 +1333,29 @@ class HauntedScene:
                 self.spider.append(c.create_line(0, 0, 1, 1, fill="#6a4a9a"))
         self.spider_y = 30
 
+        # Foreground silhouettes: the nearest layer, so it slides the most.
+        _fg0 = self._begin()
+        pts = [-40, H + 10]
+        x = -40.0
+        while x < W + 40:
+            blade = rnd.uniform(5, 16)
+            pts += [x, H - 2, x + 3.2, H - blade, x + 6.4, H - 2]
+            x += 6.4
+        pts += [W + 40, H + 10]
+        c.create_polygon(pts, fill="#050309", outline="")
+        for sx in (W * 0.06, W * 0.52, W * 0.91):   # dead cattails
+            lean = rnd.uniform(-5, 5)
+            top = H - rnd.uniform(34, 46)
+            c.create_line(sx, H, sx + lean, top, fill="#050309", width=2)
+            c.create_oval(sx + lean - 2.4, top - 7, sx + lean + 2.4, top + 6,
+                          fill="#050309", outline="")
+        for (x1, y1), (x2, y2) in (((-20, 10), (36, 22)), ((36, 22), (74, 50)),
+                                   ((74, 50), (92, 84)), ((36, 22), (66, 16)),
+                                   ((66, 16), (96, 24)), ((50, 32), (48, 60))):
+            c.create_line(x1, y1, x2, y2, fill="#050309",
+                          width=4 if x1 < 40 else 2.5, capstyle="round")
+        self._end("L_fg", _fg0)
+
         # Title.
         tx, ty = W / 2, 30
         font = ("Chiller", 36)
@@ -1058,6 +1367,49 @@ class HauntedScene:
                                      fill="#ff7518")
         self.skull_r = c.create_text(tx + 138, ty, text="\u2620", font=("Segoe UI Symbol", 20),
                                      fill="#ff7518")
+
+        self._build_overlay()
+
+    def _begin(self):
+        """Snapshot of the canvas items that exist right now."""
+        return set(self.c.find_all())
+
+    def _end(self, layer, start):
+        """Tag every item created since `start` as belonging to `layer`."""
+        for item in self.c.find_all():
+            if item not in start:
+                self.c.addtag_withtag(layer, item)
+
+    def _build_overlay(self):
+        """Things that stay fixed over the scene: cobweb and edge vignette."""
+        c, W, H = self.c, self.W, self.H
+        rnd = random.Random(21)
+        for _ in range(40):
+            x, y = rnd.uniform(0, W), rnd.uniform(0, H)
+            item = c.create_line(x, y, x - 2, y + 8, fill="#7a82c8", state="hidden")
+            self.rain.append({"id": item, "x": x, "y": y, "v": rnd.uniform(220, 340)})
+        self._cobweb(W, 0, 54)
+        for width, stip in ((34, "gray12"), (20, "gray25"), (9, "gray50")):
+            top = width * 0.4
+            for box in ((0, 0, width, H), (W - width, 0, W, H),
+                        (0, 0, W, top), (0, H - width, W, H)):
+                c.create_rectangle(*box, fill="#05020a", outline="", stipple=stip)
+
+    def _cobweb(self, cx, cy, R):
+        c = self.c
+        angles = [math.pi / 2 + i * (math.pi / 2) / 5 for i in range(6)]
+        col = "#8a7aa8"
+        for a in angles:
+            c.create_line(cx, cy, cx + R * math.cos(a), cy + R * math.sin(a), fill=col)
+        for frac in (0.3, 0.55, 0.8, 1.0):
+            r = R * frac
+            for a1, a2 in zip(angles, angles[1:]):
+                p1 = (cx + r * math.cos(a1), cy + r * math.sin(a1))
+                p2 = (cx + r * math.cos(a2), cy + r * math.sin(a2))
+                am = (a1 + a2) / 2
+                sag = (cx + r * 0.9 * math.cos(am), cy + r * 0.9 * math.sin(am))
+                c.create_line(p1[0], p1[1], sag[0], sag[1], p2[0], p2[1],
+                              smooth=True, fill=col)
 
     def _house(self, cx, base, s, body="#0b0612", edge="#2a1743"):
         c = self.c
@@ -1076,6 +1428,8 @@ class HauntedScene:
         for wx1, wy1, wx2, wy2 in ((-28, -38, -16, -22), (14, -38, 26, -22),
                                    (-59, -62, -49, -48), (-4, -74, 4, -60),
                                    (46, -22, 56, -10)):
+            c.create_rectangle(*P(wx1 - 4, wy1 - 4, wx2 + 4, wy2 + 4), fill="#ff9a1a",
+                               outline="", stipple="gray12")   # soft halo
             item = c.create_rectangle(*P(wx1, wy1, wx2, wy2), fill="#ffcf5a", outline="")
             self.windows.append([item, random.uniform(0, 6.28)])
 
@@ -1102,12 +1456,13 @@ class HauntedScene:
         c.create_line(x - 7 * s, base - 17 * s, x + 7 * s, base - 17 * s, fill="#41325f",
                       width=3 * s)
 
-    def _make_fog(self, rnd, y):
+    def _make_fog(self, rnd, y, color="#4a336f", stipple="gray50", slow=1.0):
         fw = rnd.uniform(110, 190)
         fx = rnd.uniform(-60, self.W)
         item = self.c.create_oval(fx, y, fx + fw, y + rnd.uniform(14, 22),
-                                  fill="#4a336f", outline="", stipple="gray50")
-        self.fog.append({"id": item, "w": fw, "speed": rnd.choice((-1, 1)) * rnd.uniform(5, 12)})
+                                  fill=color, outline="", stipple=stipple)
+        self.fog.append({"id": item, "w": fw,
+                         "speed": rnd.choice((-1, 1)) * rnd.uniform(5, 12) * slow})
 
     def _make_bat(self, tag, x, y, size):
         c = self.c
@@ -1231,6 +1586,33 @@ class HauntedScene:
     def set_fear(self, fear):
         self.fear = max(0.0, min(1.0, float(fear)))
 
+    def set_parallax(self, on):
+        self.parallax = bool(on)
+
+    def _on_leave(self, _event=None):
+        self._hover = False
+
+    def _apply_parallax(self, dt):
+        """Slide each depth layer a different amount so the scene has depth."""
+        if self.parallax:
+            if self._hover:
+                tx, ty = self._mx, self._my
+            else:  # idle: a slow, gentle camera drift
+                tx = 0.5 * math.sin(self._t * 0.27)
+                ty = 0.5 * math.sin(self._t * 0.19 + 1.0)
+        else:
+            tx = ty = 0.0
+        k = min(1.0, dt * 5.0)
+        self._px += (tx - self._px) * k
+        self._py += (ty - self._py) * k
+        for name, (ax, ay) in self.AMP.items():
+            nx, ny = -self._px * ax, -self._py * ay
+            ox, oy = self.off[name]
+            dx, dy = nx - ox, ny - oy
+            if abs(dx) > 0.05 or abs(dy) > 0.05:
+                self.c.move("L_" + name, dx, dy)
+                self.off[name] = (nx, ny)
+
     def apply_level(self):
         L = self.level
         n_bats = min(len(self.bats), 1 + L // 2)
@@ -1268,6 +1650,9 @@ class HauntedScene:
     # ------------------------------------------------------------------
 
     def _on_motion(self, event):
+        self._hover = True
+        self._mx = max(-1.0, min(1.0, (event.x / self.W - 0.5) * 2))
+        self._my = max(-1.0, min(1.0, (event.y / self.H - 0.5) * 2))
         if not (self.enabled and self.sparks):
             return
         now = time.perf_counter()
@@ -1340,7 +1725,9 @@ class HauntedScene:
     def _update(self, dt, now):
         c, t, W = self.c, self._t, self.W
         fear = self.fear
-        speed_mul = 1.0 + fear * 0.8
+        speed_mul = 1.0 + fear * 0.8 + (0.6 if self.thinking else 0.0)
+
+        self._apply_parallax(dt)
 
         # Stars twinkle.
         for item, ph, sp in self.stars:
@@ -1349,9 +1736,19 @@ class HauntedScene:
 
         # Moon glow pulses.
         mx, my, mr = self.moon
+        fox, foy = self.off["far"]
+        mx, my = mx + fox, my + foy
         for k, (gid, extra) in enumerate(self.moon_glow):
             r = mr + extra + 1.8 * math.sin(t * 1.3 + k)
             c.coords(gid, mx - r, my - r, mx + r, my + r)
+
+        # Moonlight shafts.
+        gy = self.ground - 6
+        for ray in self.rays:
+            sway = math.sin(t * 0.4 + ray["ph"]) * 9
+            bx = mx + ray["dx"] + sway
+            c.coords(ray["id"], mx - 4, my + 8, mx + 4, my + 8,
+                     bx + ray["w"], gy, bx - ray["w"], gy)
 
         # Window and pumpkin flicker.
         for win in self.windows:
@@ -1360,7 +1757,7 @@ class HauntedScene:
                 c.itemconfigure(win[0], fill=random.choice(
                     ("#ffcf5a", "#ff9a1a", "#ffe49a", "#ffcf5a", "#6b3a10")))
         for pk in self.pumpkins:
-            f = 0.5 + 0.5 * math.sin(t * 7 + pk["ph"]) * random.uniform(0.6, 1.0)
+            f = 0.5 + 0.5 * math.sin(t * (7 + (14 if self.thinking else 0)) + pk["ph"]) * random.uniform(0.6, 1.0)
             col = lerp_color("#ff9a00", "#fff3a0", f)
             for face in pk["face"]:
                 c.itemconfigure(face, fill=col)
@@ -1396,8 +1793,10 @@ class HauntedScene:
         for wisp in self.wisps:
             if not wisp["vis"]:
                 continue
-            x = wisp["cx"] + wisp["ax"] * math.sin(t * wisp["sp"] + wisp["ph"])
-            y = wisp["cy"] + wisp["ay"] * math.sin(t * wisp["sp"] * 1.7 + wisp["ph"])
+            x = (wisp["cx"] + self.off["near"][0]
+                 + wisp["ax"] * math.sin(t * wisp["sp"] + wisp["ph"]))
+            y = (wisp["cy"] + self.off["near"][1]
+                 + wisp["ay"] * math.sin(t * wisp["sp"] * 1.7 + wisp["ph"]))
             pulse = 3.4 + 0.9 * math.sin(t * 3 + wisp["ph"])
             c.coords(wisp["glow"], x - pulse * 2, y - pulse * 2, x + pulse * 2, y + pulse * 2)
             c.coords(wisp["core"], x - 1.8, y - 1.8, x + 1.8, y + 1.8)
@@ -1405,7 +1804,7 @@ class HauntedScene:
         # Spider bobs on its thread.
         if self.level >= 3:
             sy = 26 + 20 * math.sin(t * 0.7)
-            sx = self.spider_x
+            sx = self.spider_x + self.off["mid"][0]
             c.coords(self.spider_thread, sx, 0, sx, sy)
             c.coords(self.spider[0], sx - 3.4, sy - 3, sx + 3.4, sy + 3.4)
             idx = 1
@@ -1424,7 +1823,8 @@ class HauntedScene:
         # Embers rise from the pumpkins.
         if len(self.particles) < 60 and random.random() < 0.05 * self.level * dt * 30 / 6:
             pk = random.choice(self.pumpkins)
-            self._spawn_particle(pk["cx"] + random.uniform(-4, 4), pk["cy"] - pk["r"],
+            self._spawn_particle(pk["cx"] + self.off["near"][0] + random.uniform(-4, 4),
+                                 pk["cy"] + self.off["near"][1] - pk["r"],
                                  random.uniform(-8, 8), random.uniform(-40, -22),
                                  random.uniform(1.2, 2.0), random.uniform(1.0, 1.8),
                                  random.choice(("#ffb347", "#ff7518", "#ffe066")))
@@ -1434,6 +1834,8 @@ class HauntedScene:
         self._update_lightning(now)
         self._update_title(now)
         self._update_fear_glow()
+        self._update_rain(dt)
+        self._update_toasts(dt)
 
     def _update_bat(self, bat, dt, speed_mul):
         c, t, W = self.c, self._t, self.W
@@ -1491,8 +1893,9 @@ class HauntedScene:
         w = t * 4.2 + sk["ph"]
         bob = -abs(math.sin(w)) * 2.6 * s
         sway = math.sin(w * 0.5) * 2.2 * s
-        base = G + 10  # feet stand a little in front of the ground line
-        x0 = sk["x"]
+        nox, noy = self.off["near"]
+        base = G + 10 + noy  # feet stand a little in front of the ground line
+        x0 = sk["x"] + nox
         hipx, hipy = x0 + sway * 0.6, base - 27 * s + bob
         nx, ny = x0 + sway, base - 52 * s + bob
         hx, hy = x0 + sway * 1.2, base - 62 * s + bob
@@ -1531,12 +1934,81 @@ class HauntedScene:
         if self.level >= 4 and not self._flash_windows and now >= self._next_flash:
             self._flash_windows = [(now, now + 0.08), (now + 0.17, now + 0.29)]
             self._next_flash = now + random.uniform(8, 20) / (1 + self.fear * 2.5)
+            self._make_bolt()
         if self._flash_windows:
             on = any(a <= now <= b for a, b in self._flash_windows)
             self.c.itemconfigure(self.flash, state="normal" if on else "hidden")
+            if self._bolt is not None:
+                self.c.itemconfigure(self._bolt, state="normal" if on else "hidden")
             if now > self._flash_windows[-1][1]:
                 self._flash_windows = []
                 self.c.itemconfigure(self.flash, state="hidden")
+                self._drop_bolt()
+
+    def _make_bolt(self):
+        """A jagged lightning bolt that flashes with the sky."""
+        self._drop_bolt()
+        x = random.uniform(self.W * 0.15, self.W * 0.8)
+        y = 0.0
+        pts = [x, y]
+        while y < self.ground - 20:
+            y += random.uniform(10, 18)
+            x += random.uniform(-14, 14)
+            pts += [x, y]
+        self._bolt = self.c.create_line(pts, fill="#efe6ff", width=2)
+        self.c.tag_raise(self._bolt, self.flash)
+
+    def _drop_bolt(self):
+        if self._bolt is not None:
+            self.c.delete(self._bolt)
+            self._bolt = None
+
+    def _update_rain(self, dt):
+        on = self.fear >= 0.5 and self.level >= 3
+        if on != self._rain_on:
+            self._rain_on = on
+            for d in self.rain:
+                self.c.itemconfigure(d["id"], state="normal" if on else "hidden")
+        if not on:
+            return
+        for d in self.rain:
+            d["y"] += d["v"] * dt
+            d["x"] -= d["v"] * 0.22 * dt
+            if d["y"] > self.H:
+                d["y"] = -10
+                d["x"] = random.uniform(0, self.W + 40)
+            if d["x"] < -10:
+                d["x"] = self.W + 10
+            self.c.coords(d["id"], d["x"], d["y"], d["x"] - 2, d["y"] + 8)
+
+    def toast(self, text, color="#ffd24a"):
+        """A message that floats up from the bottom of the scene and fades."""
+        if not self.enabled:
+            return
+        for old in self.toasts:
+            self.c.delete(old["id"])
+            self.c.delete(old["sh"])
+        self.toasts = []
+        x, y = self.W / 2, self.H - 44
+        font = ("Segoe UI", 12, "bold")
+        shadow = self.c.create_text(x + 1, y + 1, text=text, font=font, fill="#05020a")
+        item = self.c.create_text(x, y, text=text, font=font, fill=color)
+        self.toasts.append({"id": item, "sh": shadow, "y": y, "life": 2.0,
+                            "max": 2.0, "color": color})
+
+    def _update_toasts(self, dt):
+        for ts in list(self.toasts):
+            ts["life"] -= dt
+            if ts["life"] <= 0:
+                self.c.delete(ts["id"])
+                self.c.delete(ts["sh"])
+                self.toasts.remove(ts)
+                continue
+            ts["y"] -= 14 * dt
+            frac = min(1.0, ts["life"] / ts["max"] * 2.0)
+            self.c.coords(ts["id"], self.W / 2, ts["y"])
+            self.c.coords(ts["sh"], self.W / 2 + 1, ts["y"] + 1)
+            self.c.itemconfigure(ts["id"], fill=lerp_color("#1b0f2b", ts["color"], frac))
 
     def _update_title(self, now):
         if not self._title_flicker and now >= self._next_title_flicker:
@@ -1569,13 +2041,112 @@ class HauntedScene:
 # GUI
 # ---------------------------------------------------------------------------
 
+class Backdrop:
+    """Soft light pools and drifting motes behind the whole window, so the
+    margins and gaps between panels have depth instead of a flat colour."""
+
+    FPS = 12
+    COLORS = ("#b46bff", "#ff7518", "#7dff4f", "#ffd24a", "#b46bff")
+
+    def __init__(self, canvas, width, height):
+        self.c = canvas
+        self.W, self.H = width, height
+        self.enabled = True
+        self._job = None
+        self._t = 0.0
+        self._last = time.perf_counter()
+        self._rnd = random.Random(5)
+        rnd = self._rnd
+        bands = 30
+        for i in range(bands):
+            col = lerp_color("#0a0610", "#210f33", (i / (bands - 1)) ** 1.5)
+            canvas.create_rectangle(0, i * height / bands, width,
+                                    (i + 1) * height / bands + 1, fill=col, outline="")
+        for x, y, r, col in ((width * 0.08, height * 0.16, 190, "#3b1a5e"),
+                             (width * 0.96, height * 0.52, 220, "#2a1445"),
+                             (width * 0.22, height * 0.98, 240, "#4b1d78")):
+            for k, stip in enumerate(("gray12", "gray12", "gray25")):
+                rr = r * (1 - 0.3 * k)
+                canvas.create_oval(x - rr, y - rr, x + rr, y + rr, fill=col,
+                                   outline="", stipple=stip)
+        self.motes = []
+        for _ in range(36):
+            base = rnd.choice(self.COLORS)
+            item = canvas.create_oval(0, 0, 1, 1, fill=base, outline="", tags=("mote",))
+            self.motes.append({"id": item, "x": rnd.uniform(0, width),
+                               "y": rnd.uniform(0, height), "vy": rnd.uniform(5, 16),
+                               "ph": rnd.uniform(0, 6.28), "r": rnd.uniform(0.9, 2.3),
+                               "color": base})
+
+    def start(self):
+        if self._job is None and self.enabled:
+            self._last = time.perf_counter()
+            self._job = self.c.after(1, self._tick)
+
+    def stop(self):
+        if self._job is not None:
+            try:
+                self.c.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+    def set_enabled(self, on):
+        self.enabled = bool(on)
+        try:
+            self.c.itemconfigure("mote", state="normal" if self.enabled else "hidden")
+        except tk.TclError:
+            return
+        if self.enabled:
+            self.start()
+        else:
+            self.stop()
+
+    def _tick(self):
+        self._job = None
+        now = time.perf_counter()
+        dt = min(0.2, now - self._last)
+        self._last = now
+        delay = 400
+        try:
+            if self.c.winfo_viewable():
+                self._t += dt
+                try:
+                    self._update(dt)
+                except Exception:
+                    pass
+                delay = int(1000 / self.FPS)
+        except tk.TclError:
+            return
+        if self.enabled:
+            try:
+                self._job = self.c.after(delay, self._tick)
+            except tk.TclError:
+                pass
+
+    def _update(self, dt):
+        t, W, H = self._t, self.W, self.H
+        for m in self.motes:
+            m["y"] -= m["vy"] * dt
+            m["x"] += math.sin(t * 0.6 + m["ph"]) * 6 * dt
+            if m["y"] < -6:
+                m["y"] = H + 6
+                m["x"] = self._rnd.uniform(0, W)
+            r = m["r"]
+            self.c.coords(m["id"], m["x"] - r, m["y"] - r, m["x"] + r, m["y"] + r)
+            glow = 0.45 + 0.55 * math.sin(t * 1.5 + m["ph"]) ** 2
+            self.c.itemconfigure(m["id"], fill=lerp_color("#1b0f2b", m["color"], glow))
+
+
 class LiveChessDashboard(ctk.CTk):
 
     def __init__(self):
         super().__init__()
 
         self.title("Haunted Stockfish")
-        self.geometry("580x880")
+        # Tall enough for the new command deck, but never taller than the screen.
+        self._win_h = max(780, min(1000, self.winfo_screenheight() - 90))
+        self.geometry(f"580x{self._win_h}")
         self.resizable(False, False)
         self.configure(fg_color=BG)
 
@@ -1623,8 +2194,25 @@ class LiveChessDashboard(ctk.CTk):
         self.persona = persona if persona in PERSONAS else "Plain"
         self.s_neural = bool(cfg.get("neural", False))
         self.s_quality = bool(cfg.get("quality", True))
+        self.s_quality_voice = bool(cfg.get("quality_voice", True))
+        self.s_quality_big_only = bool(cfg.get("quality_big_only", False))
+        self.s_auto_move = False  # never saved: auto-move is always OFF at launch
+        self.auto_delay = num_setting(cfg, "auto_delay", 1.2, 0.3, 4.0)
+        self.play_now_until = 0.0  # "play it once" key is armed until this time
+        self.s_silent_hidden = bool(cfg.get("silent_hidden", True))
+        self.win_alpha = num_setting(cfg, "alpha", 1.0, 0.4, 1.0)
+        self.last_grade = None     # the opponent's last graded move + explanation
+        self._wake = threading.Event()  # wakes the worker loop right away
+        self._console_was_visible = False
         self.quality_tally = {}
         self._telemetry_text = "Engine: idle"
+        self.s_parallax = bool(cfg.get("parallax", True))
+        self.s_backdrop = bool(cfg.get("backdrop", True))
+        self.s_topmost = bool(cfg.get("topmost", False))
+        self.s_muted = False
+        self.paused = False
+        self.grim_count = 0
+        self.eval_history = []   # centipawns from your side, one per suggestion
         self.page_typing = False       # typing in a box on the web page
         self.fear_value = 0.0
         self.speaker = SpeechQueue(lambda m: self.log(f"[VOICE ERROR] {m}"))
@@ -1636,6 +2224,13 @@ class LiveChessDashboard(ctk.CTk):
         # ----- keys -----
         self.hotkey = str(cfg.get("hotkey", DEFAULT_HOTKEY)).lower()
         self.reveal_key = str(cfg.get("reveal_key", DEFAULT_REVEAL_KEY)).lower()
+        self.hide_key = str(cfg.get("hide_key", "f9")).lower()
+        self.hidden = False  # dashboard minimized + arrows cleared
+        self.extra_keys = {
+            a: str(cfg.get("key_" + a, default)).lower()
+            for a, (_label, default) in EXTRA_ACTIONS.items()
+        }
+        self.extra_btns = {}
         self.recording_target = None  # "repeat", "reveal", or None
         self._rebind_token = 0
         self._held = set()
@@ -1651,6 +2246,13 @@ class LiveChessDashboard(ctk.CTk):
 
         self._build_ui()
 
+        # Animated backdrop behind every other widget.
+        self.backdrop_canvas = tk.Canvas(self, bg=BG, highlightthickness=0, bd=0)
+        self.backdrop_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        tk.Misc.lower(self.backdrop_canvas)
+        self.backdrop = Backdrop(self.backdrop_canvas, 580, self._win_h)
+        self.backdrop.set_enabled(self.s_backdrop)
+
         # Track whether a text box in this window has focus, so a shortcut
         # doesn't fire while you type. (Only applies while this window is in
         # front - see _dashboard_in_front.)
@@ -1664,7 +2266,13 @@ class LiveChessDashboard(ctk.CTk):
 
         self.scene.set_level(self.s_scene_level)
         self.scene.sparks = self.s_sparks
+        self.scene.set_parallax(self.s_parallax)
         self.scene.set_enabled(self.s_scene_on)
+        try:
+            self.attributes("-topmost", self.s_topmost)
+            self.attributes("-alpha", self.win_alpha)
+        except tk.TclError:
+            pass
         self._apply_cursor()
         if self.s_ambience:
             self.after(900, lambda: self.on_ambience_toggle(True, announce=False))
@@ -1697,7 +2305,9 @@ class LiveChessDashboard(ctk.CTk):
         self.scene = HauntedScene(self, self.scene_canvas, banner_w, banner_h)
 
         # ----- status + fear meter -----
-        info = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=12)
+        info = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=12,
+                            border_width=2, border_color=PURPLE_DARK)
+        self.info_frame = info
         info.pack(fill="x", padx=16, pady=(0, 6))
         info.grid_columnconfigure(1, weight=1)
         self.status_label = ctk.CTkLabel(
@@ -1723,8 +2333,46 @@ class LiveChessDashboard(ctk.CTk):
             anchor="w", justify="left",
         )
         self.telemetry_label.grid(
-            row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 8)
+            row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 4)
         )
+        self.eval_canvas = tk.Canvas(
+            info, height=44, bg=SURFACE, highlightthickness=0, bd=0
+        )
+        self.eval_canvas.grid(row=2, column=0, columnspan=3, sticky="ew",
+                              padx=12, pady=(0, 6))
+        self.eval_canvas.bind("<Configure>", lambda _e: self._draw_eval())
+
+        # Command deck: live switches you can click (or use the shortcut keys).
+        deck = ctk.CTkFrame(info, fg_color="transparent")
+        deck.grid(row=3, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 6))
+        deck.grid_columnconfigure((0, 1, 2), weight=1, uniform="chip")
+        chip_opts = dict(height=28, corner_radius=14, border_width=1,
+                         font=self.f_small)
+        self.chip_auto = ctk.CTkButton(
+            deck, text="", command=lambda: self.run_extra_action("auto"), **chip_opts)
+        self.chip_auto.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self.chip_voice = ctk.CTkButton(
+            deck, text="", command=lambda: self.run_extra_action("quality"), **chip_opts)
+        self.chip_voice.grid(row=0, column=1, sticky="ew", padx=3)
+        self.chip_sound = ctk.CTkButton(
+            deck, text="", command=lambda: self.run_extra_action("mute"), **chip_opts)
+        self.chip_sound.grid(row=0, column=2, sticky="ew", padx=(3, 0))
+
+        # The opponent's last move, graded, with the reason underneath.
+        self.grade_card = ctk.CTkFrame(
+            info, fg_color=SURFACE2, corner_radius=10,
+            border_width=2, border_color=PURPLE_DARK)
+        self.grade_card.grid(row=4, column=0, columnspan=3, sticky="ew",
+                             padx=10, pady=(0, 10))
+        self.grade_title = ctk.CTkLabel(
+            self.grade_card, text="Opponent's last move: waiting...",
+            font=self.f_value, text_color=MUTED, anchor="w")
+        self.grade_title.pack(fill="x", padx=10, pady=(6, 0))
+        self.grade_body = ctk.CTkLabel(
+            self.grade_card, text="", font=self.f_small, text_color=TEXT,
+            anchor="w", justify="left", wraplength=500)
+        self.grade_body.pack(fill="x", padx=10, pady=(0, 6))
+        self._refresh_chips()
 
         # ----- tabs -----
         self.tabs = ctk.CTkTabview(
@@ -1738,6 +2386,8 @@ class LiveChessDashboard(ctk.CTk):
             segmented_button_unselected_hover_color=PURPLE_DARK,
             text_color=TEXT,
             corner_radius=14,
+            border_width=1,
+            border_color=PURPLE_DARK,
         )
         self.tabs.pack(fill="x", padx=16, pady=4)
         play = self._tab_frame("\u263d Play")
@@ -1745,12 +2395,14 @@ class LiveChessDashboard(ctk.CTk):
         board = self._tab_frame("\u265e Board")
         keys = self._tab_frame("\u2328 Keys")
         spooky = self._tab_frame("\u2620 Spooky")
+        grim = self._tab_frame("\u269c Grimoire")
 
         self._build_play_tab(play)
         self._build_engine_tab(engine)
         self._build_board_tab(board)
         self._build_keys_tab(keys)
         self._build_spooky_tab(spooky)
+        self._build_grimoire_tab(grim)
 
         # ----- start / stop -----
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -1793,7 +2445,8 @@ class LiveChessDashboard(ctk.CTk):
         self.progress.pack(fill="x", padx=18, pady=(8, 4))
 
         # ----- activity log -----
-        log_frame = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=14)
+        log_frame = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=14,
+                                 border_width=1, border_color=PURPLE_DARK)
         log_frame.pack(fill="both", expand=True, padx=16, pady=(4, 14))
         ctk.CTkLabel(
             log_frame, text="Spirit Log", font=self.f_section, text_color=PUMPKIN
@@ -1964,6 +2617,46 @@ class LiveChessDashboard(ctk.CTk):
             " test against your own phone or a second account of yours.",
         )
 
+        self._section(tab, "\u26a1 Auto-move")
+        self.auto_switch = self._switch(
+            tab, "Play the suggested move for me", self.s_auto_move,
+            self.on_auto_toggle,
+        )
+        self._slider(
+            tab, "Auto-move pace (randomised a little)", 0.3, 4.0, 37,
+            self.auto_delay,
+            lambda v: f"{float(v):.1f} s",
+            lambda v: setattr(self, "auto_delay", round(float(v), 1)),
+        )
+        self._note(
+            tab,
+            "Clicks the suggested move on the board for you. Always OFF when the"
+            " app starts. The Auto-move key toggles it; the Play-once key plays"
+            " just the current suggestion. Auto-move never runs while the panic"
+            " key has everything hidden.",
+        )
+
+        self._section(tab, "Stealth (panic key)")
+        self._switch(
+            tab, "Stay silent while hidden", self.s_silent_hidden,
+            lambda v: self._set("s_silent_hidden", bool(v)),
+        )
+        self._note(
+            tab,
+            "Press the Hide key (F9 by default): the dashboard vanishes - no"
+            " taskbar icon, not in Alt+Tab - the arrows disappear, the voice and"
+            " ambience stop and auto-move pauses. Press the key again to bring"
+            " it all back. Start with pythonw so there is no console window.",
+        )
+
+        self._section(tab, "Window")
+        self._switch(tab, "Keep this window on top", self.s_topmost, self.on_topmost_toggle)
+        self._slider(
+            tab, "Window opacity", 0.4, 1.0, 12, self.win_alpha,
+            lambda v: f"{int(round(float(v) * 100))}%",
+            lambda v: self._apply_alpha(float(v)),
+        )
+
         self._section(tab, "How to use")
         self._note(
             tab,
@@ -1997,6 +2690,22 @@ class LiveChessDashboard(ctk.CTk):
             " Best / Good / Inaccuracy / Mistake / Blunder).",
         )
 
+        self._section(tab, "Voice callouts")
+        self.qvoice_switch = self._switch(
+            tab, "Say out loud how good their last move was",
+            self.s_quality_voice, self.on_qvoice_toggle,
+        )
+        self._switch(
+            tab, "Only speak for brilliant moves, mistakes and blunders",
+            self.s_quality_big_only, self.on_qbig_toggle,
+        )
+        self._note(
+            tab,
+            "After each opponent move you hear a short verdict. Press the Explain"
+            " key (F2) and it tells you WHY: what they hung, what they missed, or"
+            " what made the move strong.",
+        )
+
         self._section(tab, "Strength (when showing 1 move)")
         self._switch(
             tab,
@@ -2027,7 +2736,7 @@ class LiveChessDashboard(ctk.CTk):
         )
 
         self._label(tab, "Moves to show")
-        self._segmented(
+        self.lines_seg = self._segmented(
             tab, ["1", "2", "3"], str(self.s_lines), self.on_lines_change
         )
         ctk.CTkLabel(
@@ -2092,6 +2801,34 @@ class LiveChessDashboard(ctk.CTk):
         self.reveal_btn.configure(fg_color=SURFACE2)
         self.reveal_btn.grid(row=0, column=1, sticky="e")
 
+        row3 = ctk.CTkFrame(tab, fg_color="transparent")
+        row3.pack(fill="x", padx=10, pady=4)
+        row3.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            row3, text="Hide / show (minimize + clear arrows)", font=self.f_label,
+            text_color=TEXT,
+        ).grid(row=0, column=0, sticky="w")
+        self.hide_btn = self._button(
+            row3, self.hide_key.upper(), lambda: self.begin_rebind("hide"), width=150
+        )
+        self.hide_btn.configure(fg_color=SURFACE2)
+        self.hide_btn.grid(row=0, column=1, sticky="e")
+
+        for action, (label, _default) in EXTRA_ACTIONS.items():
+            row = ctk.CTkFrame(tab, fg_color="transparent")
+            row.pack(fill="x", padx=10, pady=4)
+            row.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(
+                row, text=label, font=self.f_label, text_color=TEXT
+            ).grid(row=0, column=0, sticky="w")
+            btn = self._button(
+                row, self.extra_keys[action].upper(),
+                lambda a=action: self.begin_rebind("x:" + a), width=150,
+            )
+            btn.configure(fg_color=SURFACE2)
+            btn.grid(row=0, column=1, sticky="e")
+            self.extra_btns[action] = btn
+
         self._note(
             tab,
             "Click a key button, then press the key you want (Esc cancels)."
@@ -2123,6 +2860,9 @@ class LiveChessDashboard(ctk.CTk):
             lambda v: f"{int(round(float(v)))}%",
             lambda v: setattr(self, "voice_volume", int(round(float(v)))),
         )
+        self.mute_switch = self._switch(
+            tab, "Mute the voice", self.s_muted, self.on_mute_toggle
+        )
         self._button(tab, "Test the voice", self.test_voice, width=150).pack(
             anchor="w", padx=10, pady=(8, 8)
         )
@@ -2143,6 +2883,14 @@ class LiveChessDashboard(ctk.CTk):
             tab, "Skull-and-crossbones cursor", self.s_skull_cursor,
             self.on_skull_cursor_toggle,
         )
+        self._switch(
+            tab, "Depth: scene layers slide with your mouse", self.s_parallax,
+            self.on_parallax_toggle,
+        )
+        self._switch(
+            tab, "Drifting motes in the window background", self.s_backdrop,
+            self.on_backdrop_toggle,
+        )
         self._note(
             tab,
             "Click the scene for a surprise. More spookiness = more bats, ghosts,"
@@ -2151,7 +2899,9 @@ class LiveChessDashboard(ctk.CTk):
         )
 
         self._section(tab, "Voice persona")
-        self._segmented(tab, list(PERSONAS), self.persona, self.on_persona_change)
+        self.persona_seg = self._segmented(
+            tab, list(PERSONAS), self.persona, self.on_persona_change
+        )
         self._switch(
             tab, "Neural voice (edge-tts, needs internet)", self.s_neural,
             self.on_neural_toggle,
@@ -2177,8 +2927,34 @@ class LiveChessDashboard(ctk.CTk):
             tab,
             "The bar under the scene shows how scared you should be, from the"
             " engine's evaluation of your position. As fear rises the sky turns"
-            " red, lightning strikes more often, and the bats fly faster.",
+            " red, lightning strikes more often, and the bats fly faster. Past"
+            " 'Terrified' it starts to rain.",
         )
+
+    def on_parallax_toggle(self, value):
+        self.s_parallax = bool(value)
+        self.scene.set_parallax(value)
+        self.schedule_save()
+
+    def on_backdrop_toggle(self, value):
+        self.s_backdrop = bool(value)
+        self.backdrop.set_enabled(value)
+        self.schedule_save()
+
+    def on_topmost_toggle(self, value):
+        self.s_topmost = bool(value)
+        try:
+            self.attributes("-topmost", self.s_topmost)
+        except tk.TclError:
+            pass
+        self.schedule_save()
+
+    def on_mute_toggle(self, value):
+        self.s_muted = bool(value)
+        if value:
+            self.speaker.cancel_current()
+        self._refresh_chips()
+        self.log(f"[INFO] Voice {'muted' if value else 'unmuted'}.")
 
     def on_scene_toggle(self, value):
         self.s_scene_on = value
@@ -2234,6 +3010,64 @@ class LiveChessDashboard(ctk.CTk):
         self.schedule_save()
         self.log(f"[INFO] Opponent move grading {'on' if value else 'off'}.")
 
+    def on_qvoice_toggle(self, value):
+        self.s_quality_voice = bool(value)
+        self.schedule_save()
+        self._refresh_chips()
+        self.log(f"[INFO] Spoken move callouts {'on' if value else 'off'}.")
+
+    def on_qbig_toggle(self, value):
+        self.s_quality_big_only = bool(value)
+        self.schedule_save()
+
+    def on_auto_toggle(self, value):
+        self.s_auto_move = bool(value)
+        self._wake.set()
+        self._refresh_chips()
+        self.log(f"[AUTO] Auto-move {'ON' if value else 'off'}.")
+
+    def _apply_alpha(self, value):
+        self.win_alpha = round(max(0.4, min(1.0, value)), 2)
+        try:
+            self.attributes("-alpha", self.win_alpha)
+        except tk.TclError:
+            pass
+
+    def _refresh_chips(self):
+        if not hasattr(self, "chip_auto"):
+            return
+
+        def style(chip, on, text):
+            chip.configure(
+                text=text,
+                fg_color=PUMPKIN if on else SURFACE2,
+                hover_color=PUMPKIN_HOVER if on else PURPLE_DARK,
+                text_color="#1a0d00" if on else MUTED,
+                border_color=PUMPKIN if on else PURPLE_DARK,
+            )
+
+        style(self.chip_auto, self.s_auto_move,
+              "\u26a1 AUTO-MOVE ON" if self.s_auto_move else "Auto-move off")
+        style(self.chip_voice, self.s_quality_voice,
+              "CALLOUTS ON" if self.s_quality_voice else "Callouts off")
+        style(self.chip_sound, not self.s_muted,
+              "SOUND ON" if not self.s_muted else "MUTED")
+
+    def _show_grade(self, label, san, text):
+        """Show the opponent's last graded move and the reason, in the card."""
+        if not label:
+            self.grade_title.configure(
+                text="Opponent's last move: waiting...", text_color=MUTED)
+            self.grade_body.configure(text="")
+            self.grade_card.configure(border_color=PURPLE_DARK)
+            return
+        color = GRADE_COLORS.get(label, TEXT)
+        self.grade_title.configure(
+            text=f"Opponent played {san}  \u2014  {label.upper()}", text_color=color)
+        short = text if len(text) <= 230 else text[:227].rsplit(" ", 1)[0] + "..."
+        self.grade_body.configure(text=short)
+        self.grade_card.configure(border_color=color)
+
     def on_ambience_toggle(self, value, announce=True):
         self.s_ambience = bool(value)
         self.schedule_save()
@@ -2252,6 +3086,79 @@ class LiveChessDashboard(ctk.CTk):
 
     def set_fear(self, fear):
         self.post(self._set_fear_now, float(fear))
+
+    def _build_grimoire_tab(self, tab):
+        self._section(tab, "Grimoire")
+        self._note(
+            tab,
+            "A running record: each move suggested (with your evaluation) and how"
+            " each opponent reply was graded.",
+        )
+        self.grim_box = ctk.CTkTextbox(
+            tab, height=190, font=("Consolas", 11), fg_color="#0b0710",
+            text_color=TEXT, border_width=1, border_color=PURPLE_DARK, corner_radius=10,
+        )
+        self.grim_box.pack(fill="x", padx=10, pady=(4, 6))
+        for tag, color in (("move", PUMPKIN), ("good", SLIME), ("warn", CANDLE),
+                           ("error", "#ff6b6b"), ("brill", "#4dd8ff"),
+                           ("dim", "#6f5d88")):
+            self.grim_box.tag_config(tag, foreground=color)
+        self.grim_box.configure(state="disabled")
+        self._button(tab, "Clear the grimoire", self.clear_grimoire, width=150).pack(
+            anchor="w", padx=10, pady=(0, 8)
+        )
+
+    def add_grimoire(self, line, tag=None):
+        self.post(self._grim_now, line, tag)
+
+    def _grim_now(self, line, tag):
+        box = self.grim_box
+        box.configure(state="normal")
+        if tag:
+            box.insert(ctk.END, line + "\n", tag)
+        else:
+            box.insert(ctk.END, line + "\n")
+        box.see(ctk.END)
+        box.configure(state="disabled")
+
+    def clear_grimoire(self):
+        self.grim_box.configure(state="normal")
+        self.grim_box.delete("1.0", ctk.END)
+        self.grim_box.configure(state="disabled")
+        self.grim_count = 0
+
+    def record_eval(self, cp):
+        self.eval_history.append(int(cp))
+        self.post(self._draw_eval)
+
+    def _draw_eval(self):
+        """The 'fate line': your evaluation after each suggestion, newest at right."""
+        cv = self.eval_canvas
+        cv.delete("all")
+        w = max(20, cv.winfo_width())
+        h = int(cv.cget("height"))
+        mid = h / 2
+        cv.create_line(0, mid, w, mid, fill=PURPLE_DARK, dash=(3, 3))
+        data = self.eval_history[-40:]
+        if len(data) < 2:
+            cv.create_text(w / 2, mid, text="Fate line: your evaluation appears here",
+                           fill=MUTED, font=self.f_small)
+            return
+        n = len(data)
+        step = (w - 8) / (n - 1)
+        pts = []
+        for i, cp in enumerate(data):
+            v = max(-500, min(500, cp)) / 500.0
+            pts += [4 + i * step, mid - v * (mid - 4)]
+        last = data[-1]
+        col = SLIME if last >= 0 else "#ff4d4d"
+        cv.create_polygon([4, mid] + pts + [4 + (n - 1) * step, mid],
+                          fill=lerp_color(SURFACE, col, 0.25), outline="")
+        cv.create_line(pts, fill=col, width=2, smooth=True)
+        x, y = pts[-2], pts[-1]
+        cv.create_oval(x - 3, y - 3, x + 3, y + 3, fill=col, outline="")
+        cv.create_text(w - 6, 8, text=f"{last / 100:+.1f}", fill=col, anchor="e",
+                       font=self.f_small)
 
     def set_telemetry(self, info):
         self._telemetry_text = telemetry_text(info)
@@ -2280,6 +3187,9 @@ class LiveChessDashboard(ctk.CTk):
         self.fear_bar.configure(progress_color=color)
         self.fear_label.configure(text=f"Fear: {label}", text_color=color)
         self.scene.set_fear(fear)
+        self.info_frame.configure(
+            border_color=lerp_color(PURPLE_DARK, color, 0.35 + 0.45 * fear)
+        )
 
     # ------------------------------------------------------------------
     # Setting callbacks (main thread)
@@ -2375,6 +3285,8 @@ class LiveChessDashboard(ctk.CTk):
             "voice_volume": self.voice_volume,
             "hotkey": self.hotkey,
             "reveal_key": self.reveal_key,
+            "hide_key": self.hide_key,
+            **{"key_" + a: k for a, k in self.extra_keys.items()},
             "scene_on": self.s_scene_on,
             "scene_level": self.s_scene_level,
             "sparks": self.s_sparks,
@@ -2382,7 +3294,15 @@ class LiveChessDashboard(ctk.CTk):
             "ambience": self.s_ambience,
             "persona": self.persona,
             "neural": self.s_neural,
+            "parallax": self.s_parallax,
+            "backdrop": self.s_backdrop,
+            "topmost": self.s_topmost,
             "quality": self.s_quality,
+            "quality_voice": self.s_quality_voice,
+            "quality_big_only": self.s_quality_big_only,
+            "auto_delay": self.auto_delay,
+            "silent_hidden": self.s_silent_hidden,
+            "alpha": self.win_alpha,
         })
 
     # ------------------------------------------------------------------
@@ -2421,7 +3341,7 @@ class LiveChessDashboard(ctk.CTk):
             tag = "error"
         elif text.startswith("[SUCCESS]"):
             tag = "good"
-        elif text.startswith(("[HOTKEY]", "[ARROWS]", "[KEYTEST]")):
+        elif text.startswith(("[HOTKEY]", "[ARROWS]", "[KEYTEST]", "[AUTO]")):
             tag = "key"
         elif text.startswith("[PAUSED]"):
             tag = "warn"
@@ -2451,6 +3371,7 @@ class LiveChessDashboard(ctk.CTk):
         self.post(self._set_thinking_now, on)
 
     def _set_thinking_now(self, on):
+        self.scene.thinking = bool(on)
         if on:
             self.progress.configure(progress_color=PUMPKIN)
             self.progress.start()
@@ -2487,6 +3408,7 @@ class LiveChessDashboard(ctk.CTk):
 
     def on_close(self):
         self.is_running = False
+        self._set_console_visible(True)
         try:
             if self._save_job is not None:
                 self.after_cancel(self._save_job)
@@ -2500,6 +3422,7 @@ class LiveChessDashboard(ctk.CTk):
             pass
         try:
             self.scene.stop()
+            self.backdrop.stop()
             self.ambience.stop()
             self.speaker.cancel_current()
         except Exception:
@@ -2509,6 +3432,8 @@ class LiveChessDashboard(ctk.CTk):
     def say(self, text, interrupt=True):
         """Queue speech. A newer move cuts off an older one, so you never hear
         stale advice or two voices at once."""
+        if self.s_muted or (self.hidden and self.s_silent_hidden):
+            return
         self.speaker.say(
             text, self.voice_rate, self.voice_volume, self.persona, interrupt,
             self.s_neural and edge_tts is not None,
@@ -2657,6 +3582,13 @@ class LiveChessDashboard(ctk.CTk):
                 threading.Thread(target=self.repeat_last_move, daemon=True).start()
             elif name == self.reveal_key:
                 self._reveal_key_down()
+            elif name == self.hide_key:
+                self.post(self.toggle_hidden)
+            else:
+                for action, key in self.extra_keys.items():
+                    if name == key:
+                        self.post(self.run_extra_action, action)
+                        break
         except Exception as e:
             self.log(f"[HOTKEY] Key handler error: {e}")
 
@@ -2689,6 +3621,125 @@ class LiveChessDashboard(ctk.CTk):
         if self.last_moves and self.reveal_count < len(self.last_moves):
             self.reveal_count += 1
 
+    def toast(self, text, color=CANDLE):
+        """A short message that floats up over the haunted scene."""
+        self.post(self.scene.toast, text, color)
+
+    def run_extra_action(self, action):
+        """Runs on the main thread when one of the extra shortcuts is pressed."""
+        if action == "mute":
+            value = not self.s_muted
+            if value:
+                self.mute_switch.select()
+            else:
+                self.mute_switch.deselect()
+            self.on_mute_toggle(value)
+            self.toast("Voice muted" if value else "Voice on", MUTED if value else SLIME)
+        elif action == "lines":
+            value = self.s_lines % 3 + 1
+            self.lines_seg.set(str(value))
+            self.on_lines_change(str(value))
+            self.toast(f"Showing {value} move{'s' if value > 1 else ''}", PUMPKIN)
+        elif action == "pause":
+            self.paused = not self.paused
+            if self.is_running:
+                self.set_status("Paused" if self.paused else "Watching",
+                                "pause" if self.paused else "run")
+            self.log(f"[INFO] Assistant {'paused' if self.paused else 'resumed'}.")
+            self.toast("Paused" if self.paused else "Awake again",
+                       CANDLE if self.paused else SLIME)
+        elif action == "auto":
+            value = not self.s_auto_move
+            if value:
+                self.auto_switch.select()
+            else:
+                self.auto_switch.deselect()
+            self.on_auto_toggle(value)
+            self.toast("Auto-move ON" if value else "Auto-move off",
+                       PUMPKIN if value else MUTED)
+        elif action == "quality":
+            value = not self.s_quality_voice
+            if value:
+                self.qvoice_switch.select()
+            else:
+                self.qvoice_switch.deselect()
+            self.on_qvoice_toggle(value)
+            self.toast("Callouts on" if value else "Callouts off",
+                       SLIME if value else MUTED)
+        elif action == "explain":
+            threading.Thread(target=self.explain_last_move, daemon=True).start()
+        elif action == "playnow":
+            if self.last_move_uci:
+                self.play_now_until = time.time() + 8
+                self._wake.set()
+                self.log("[AUTO] Playing the suggested move once...")
+            else:
+                self.log("[AUTO] No move has been suggested yet.")
+        elif action == "persona":
+            names = list(PERSONAS)
+            value = names[(names.index(self.persona) + 1) % len(names)]
+            self.persona_seg.set(value)
+            self.on_persona_change(value)
+            self.toast(f"Voice: {value}", "#c79bff")
+
+    def _set_console_visible(self, visible):
+        """Hide / restore the black console window (only if there is one)."""
+        try:
+            import ctypes
+
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if not hwnd:
+                return
+            user32 = ctypes.windll.user32
+            if not visible:
+                self._console_was_visible = bool(user32.IsWindowVisible(hwnd))
+                user32.ShowWindow(hwnd, 0)  # SW_HIDE
+            elif self._console_was_visible:
+                user32.ShowWindow(hwnd, 4)  # SW_SHOWNOACTIVATE
+        except Exception:
+            pass
+
+    def toggle_hidden(self):
+        """PANIC KEY. Hidden = the dashboard is withdrawn completely (no window,
+        no taskbar button, not in Alt+Tab), the console is hidden, the voice and
+        ambience stop, the board arrows are cleared and auto-move pauses. Press
+        the key again to bring it all back. Main thread only."""
+        self.hidden = not self.hidden
+        self._wake.set()  # the worker loop clears the arrows immediately
+        try:
+            if self.hidden:
+                self.speaker.silence()
+                if self.s_ambience:
+                    self.ambience.stop()
+                self.withdraw()
+                self._set_console_visible(False)
+            else:
+                self._set_console_visible(True)
+                self.deiconify()
+                self.lift()
+                self.attributes("-topmost", True)
+                self.after(300, lambda: self.attributes("-topmost", self.s_topmost))
+                try:
+                    self.focus_force()
+                except tk.TclError:
+                    pass
+                self._refresh_chips()
+                if self.s_ambience and self.ambience.available:
+                    threading.Thread(target=self._start_ambience, daemon=True).start()
+        except tk.TclError:
+            pass
+
+    def explain_last_move(self):
+        """Say WHY the opponent's last move was good or bad."""
+        g = self.last_grade
+        if not g:
+            self.log("[HOTKEY] No opponent move has been graded yet.")
+            self.say("I have nothing to explain yet.")
+            return
+        self.log(f"[HOTKEY] Explaining: {g['text']}")
+        self.post(self._show_grade, g["label"], g["san"], g["text"])
+        self.say(g["text"])
+
     def repeat_last_move(self):
         text = self.last_spoken_text
         if not text:
@@ -2714,7 +3765,11 @@ class LiveChessDashboard(ctk.CTk):
         self.recording_target = target
         self._rebind_token += 1
         token = self._rebind_token
-        button = self.hotkey_btn if target == "repeat" else self.reveal_btn
+        if target.startswith("x:"):
+            button = self.extra_btns[target[2:]]
+        else:
+            button = {"repeat": self.hotkey_btn, "reveal": self.reveal_btn,
+                      "hide": self.hide_btn}[target]
         button.configure(text="Press a key...", fg_color=PUMPKIN, hover_color=PUMPKIN)
         self.log("[HOTKEY] Press the key you want to use (Esc cancels).")
         self.after(10000, self._rebind_timeout, token)
@@ -2725,8 +3780,10 @@ class LiveChessDashboard(ctk.CTk):
         if name == "esc":
             self.post(self._rebind_done, "[HOTKEY] Cancelled.")
             return
-        other = self.reveal_key if target == "repeat" else self.hotkey
-        if name == other:
+        current = {"repeat": self.hotkey, "reveal": self.reveal_key, "hide": self.hide_key}
+        current.update({"x:" + a: k for a, k in self.extra_keys.items()})
+        current.pop(target, None)
+        if name in current.values():
             self.post(
                 self._rebind_done,
                 f"[HOTKEY] {name.upper()} is already used by the other shortcut."
@@ -2736,9 +3793,16 @@ class LiveChessDashboard(ctk.CTk):
         if target == "repeat":
             self.hotkey = name
             message = f"[HOTKEY] Now using {name.upper()} to repeat the move."
-        else:
+        elif target == "reveal":
             self.reveal_key = name
             message = f"[HOTKEY] Now using {name.upper()} to reveal the arrows."
+        elif target == "hide":
+            self.hide_key = name
+            message = f"[HOTKEY] Now using {name.upper()} to hide / show the dashboard."
+        else:
+            action = target[2:]
+            self.extra_keys[action] = name
+            message = f"[HOTKEY] Now using {name.upper()} for: {EXTRA_ACTIONS[action][0]}."
         self.post(self._rebind_done, message)
 
     def _rebind_timeout(self, token):
@@ -2753,6 +3817,12 @@ class LiveChessDashboard(ctk.CTk):
         self.reveal_btn.configure(
             text=self.reveal_label(), fg_color=SURFACE2, hover_color=PURPLE_DARK
         )
+        self.hide_btn.configure(
+            text=self.hide_key.upper(), fg_color=SURFACE2, hover_color=PURPLE_DARK
+        )
+        for a, b in self.extra_btns.items():
+            b.configure(text=self.extra_keys[a].upper(), fg_color=SURFACE2,
+                        hover_color=PURPLE_DARK)
         self.schedule_save()
         self._log_now(message)
 
@@ -2830,6 +3900,8 @@ class LiveChessDashboard(ctk.CTk):
         after_cp = score_cp(info_after["score"], mover)
         pv = info_before.get("pv") or []
         best_move = pv[0] if pv else None
+        pv_after = info_after.get("pv") or []
+        reply = pv_after[0] if pv_after else None
         loss = 0 if best_move == move else max(0, best_cp - after_cp)
         label = classify_move(loss, looks_like_sacrifice(before, move), best_cp, after_cp)
 
@@ -2840,8 +3912,104 @@ class LiveChessDashboard(ctk.CTk):
         if label in ("Inaccuracy", "Mistake", "Blunder") and best_move is not None:
             note += f" - best was {before.san(best_move)}"
         self.log(note)
+        self.add_grimoire(note.replace("[QUALITY] ", "   "), quality_tag(note))
+        if label == "Brilliant":
+            self.toast("Brilliant move!", "#4dd8ff")
+        elif label == "Blunder":
+            self.toast("Opponent blundered!", SLIME)
+        elif label == "Mistake":
+            self.toast("Opponent slipped", CANDLE)
         self.quality_tally[label] = self.quality_tally.get(label, 0) + 1
+        try:
+            explanation = explain_move(
+                before, move, after, label, loss, best_cp, after_cp, best_move, reply
+            )
+        except Exception as explain_err:
+            explanation = f"Their move was {LABEL_PHRASES.get(label, label.lower())}."
+            self.log(f"[DEBUG] Couldn't build an explanation: {explain_err}")
+        self.last_grade = {"label": label, "san": san, "text": explanation}
+        self.post(self._show_grade, label, san, explanation)
         self.post(self._refresh_telemetry)
+        if self.s_quality_voice and (
+            not self.s_quality_big_only or label in BIG_LABELS
+        ):
+            self.say(quality_speech(label), interrupt=False)
+
+    def _pick_promotion(self, driver, piece_type):
+        """Click the piece in chess.com's promotion pop-up."""
+        letter = chess.piece_symbol(piece_type)
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            for color in ("w", "b"):
+                found = driver.find_elements(
+                    By.CSS_SELECTOR,
+                    f".promotion-window .promotion-piece.{color}{letter}",
+                )
+                if found:
+                    try:
+                        ActionChains(driver).move_to_element(found[0]).pause(
+                            0.12).click().perform()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", found[0])
+                    return
+            time.sleep(0.1)
+
+    def auto_play(self, driver, board, move, flipped):
+        """Click `move` on the chess.com board. True if the position changed."""
+        if move not in board.legal_moves:
+            self.log("[AUTO] That move isn't legal here - skipped.")
+            return False
+        try:
+            fresh = board_from_dom(driver.execute_script(READ_BOARD_JS))
+        except Exception:
+            fresh = None
+        if fresh is None or fresh.fen() != board.fen():
+            self.log("[AUTO] The position changed - skipped.")
+            return False
+
+        san = board.san(move)
+        root = driver.find_element(By.CSS_SELECTOR, "wc-chess-board, chess-board")
+        driver.execute_script("arguments[0].scrollIntoView({block: 'nearest'});", root)
+        size = root.size
+        w, h = float(size["width"]), float(size["height"])
+
+        def spot(square):
+            # Offset from the board's centre, with a little human wobble.
+            f = chess.square_file(square)
+            r = chess.square_rank(square)
+            col = (7 - f) if flipped else f
+            row = r if flipped else (7 - r)
+            x = (col + 0.5 + random.uniform(-0.2, 0.2)) * (w / 8.0) - w / 2.0
+            y = (row + 0.5 + random.uniform(-0.2, 0.2)) * (h / 8.0) - h / 2.0
+            return int(round(x)), int(round(y))
+
+        x1, y1 = spot(move.from_square)
+        x2, y2 = spot(move.to_square)
+        chain = ActionChains(driver)
+        chain.move_to_element_with_offset(root, x1, y1).pause(
+            random.uniform(0.05, 0.15)).click()
+        chain.pause(random.uniform(0.12, 0.35))
+        chain.move_to_element_with_offset(root, x2, y2).pause(
+            random.uniform(0.05, 0.15)).click()
+        chain.perform()
+        if move.promotion:
+            self._pick_promotion(driver, move.promotion)
+
+        time.sleep(0.6)
+        try:
+            after = board_from_dom(driver.execute_script(READ_BOARD_JS))
+        except Exception:
+            after = None
+        moved = after is None or after.fen() != board.fen()
+        if moved:
+            self.log(f"[AUTO] Played {san}.")
+            self.toast(f"Auto-played {san}", PUMPKIN)
+        else:
+            self.log(
+                "[AUTO] The click didn't register. Press the Play-once key to"
+                " try again (click an empty square first if a piece is selected)."
+            )
+        return moved
 
     def run_bot_loop(self):
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2888,9 +4056,17 @@ class LiveChessDashboard(ctk.CTk):
             paused_logged = False
             prev_fear = None
             opp_pre = None  # last position seen with the opponent to move
+            auto_due_key = None   # position the auto-move timer is running for
+            auto_due_at = 0.0
+            auto_done_key = None  # position we already tried to auto-play
 
             while self.is_running:
                 try:
+                    if self.paused:
+                        self.set_overlay(driver, None, False)
+                        time.sleep(0.3)
+                        continue
+
                     # Only operate on chess.com bot games (or test mode).
                     if not find_computer_tab(driver, self.s_test_mode):
                         if not paused_logged:
@@ -2953,8 +4129,17 @@ class LiveChessDashboard(ctk.CTk):
                         game_token = object()
                         prev_fear = None
                         opp_pre = None
+                        auto_due_key = None
+                        auto_done_key = None
+                        self.last_grade = None
+                        self.post(self._show_grade, None, "", "")
                         self.quality_tally = {}
                         self.post(self._refresh_telemetry)
+                        self.eval_history = []
+                        self.post(self._draw_eval)
+                        self.grim_count = 0
+                        self.add_grimoire("---- new game ----", "dim")
+                        self.toast("A new game begins", "#c79bff")
                     was_at_start = at_start
 
                     key = board.fen() + (" me-w" if user_turn == chess.WHITE else " me-b")
@@ -2972,7 +4157,9 @@ class LiveChessDashboard(ctk.CTk):
                         self.s_overlay and rec_key == key and bool(self.last_moves)
                     )
                     self.set_overlay(
-                        driver, self.moves_to_draw() if show_arrow else None, flipped
+                        driver,
+                        self.moves_to_draw() if (show_arrow and not self.hidden) else None,
+                        flipped,
                     )
 
                     # Debounce: the position must be identical on two reads
@@ -3101,6 +4288,19 @@ class LiveChessDashboard(ctk.CTk):
                         if fear is not None:
                             prev_fear = fear
                             self.set_fear(fear)
+                        cp_now = None
+                        if score is not None:
+                            try:
+                                cp_now = score_cp(score, user_turn)
+                                self.record_eval(cp_now)
+                            except Exception:
+                                cp_now = None
+                        self.grim_count += 1
+                        self.add_grimoire(
+                            f"#{self.grim_count}  {text}  [{move_str}]"
+                            + (f"  {cp_now / 100:+.1f}" if cp_now is not None else ""),
+                            "move",
+                        )
                         spoken = compose_speech(self.persona, text, flags, alarm)
 
                         # Remember it for the hotkey and the board display.
@@ -3129,7 +4329,7 @@ class LiveChessDashboard(ctk.CTk):
 
                         # Instant mode draws right now; the other modes are
                         # handled by the loop above.
-                        if self.s_overlay and self.reveal_mode == INSTANT_MODE:
+                        if self.s_overlay and self.reveal_mode == INSTANT_MODE and not self.hidden:
                             self.set_overlay(driver, moves_uci, flipped)
 
                         # Speech runs on its own thread, so the loop keeps going.
@@ -3139,7 +4339,11 @@ class LiveChessDashboard(ctk.CTk):
                         redo_silent = False
 
                         # Grade the opponent's reply that led to this position.
-                        if self.s_quality and not was_redo and opp_pre is not None:
+                        if (
+                            (self.s_quality or self.s_quality_voice)
+                            and not was_redo
+                            and opp_pre is not None
+                        ):
                             try:
                                 self.grade_opponent_move(
                                     engine, opp_pre, board, game_token, think_time
@@ -3147,6 +4351,43 @@ class LiveChessDashboard(ctk.CTk):
                             except Exception as grade_err:
                                 self.log(f"[DEBUG] Move grading skipped: {grade_err}")
                         opp_pre = None
+
+                    # ----- auto-move (and the one-shot Play-once key) -----
+                    forced = time.time() < self.play_now_until
+                    if (
+                        rec_key == key
+                        and board.turn == user_turn
+                        and not board.is_game_over()
+                        and self.last_move_uci
+                        and (forced or auto_done_key != key)
+                    ):
+                        if forced or (self.s_auto_move and not self.hidden):
+                            if auto_due_key != key:
+                                auto_due_key = key
+                                base = float(self.auto_delay)
+                                auto_due_at = time.time() + random.uniform(
+                                    base * 0.6, base * 1.4
+                                )
+                            if forced or time.time() >= auto_due_at:
+                                self.play_now_until = 0.0
+                                auto_done_key = key
+                                try:
+                                    ok = self.auto_play(
+                                        driver, board,
+                                        chess.Move.from_uci(self.last_move_uci),
+                                        flipped,
+                                    )
+                                except Exception as auto_err:
+                                    ok = False
+                                    first = str(auto_err).splitlines()
+                                    self.log(
+                                        "[AUTO] Couldn't play the move: "
+                                        + (first[0] if first else repr(auto_err))
+                                    )
+                                if ok:
+                                    time.sleep(0.3)
+                        else:
+                            auto_due_key = None
 
                     last_error = None
 
@@ -3159,8 +4400,14 @@ class LiveChessDashboard(ctk.CTk):
 
                 waiting = (
                     self.reveal_mode == DELAY_MODE and time.time() < self.arrow_show_at
+                ) or (
+                    auto_due_key is not None
+                    and auto_done_key != auto_due_key
+                    and time.time() < auto_due_at + 0.5
                 )
-                time.sleep(0.1 if waiting else 0.5)
+                # Wakes early when you press the panic / auto / play-once keys.
+                self._wake.wait(0.1 if waiting else 0.5)
+                self._wake.clear()
 
         except Exception as e:
             self.log(f"[ERROR] {e}")
